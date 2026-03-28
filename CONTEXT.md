@@ -8,16 +8,17 @@ Paste the contents of this file at the start of a new chat session.
 ## CONTINUATION PROMPT
 
 I'm continuing work on a project called **Deal Scout** — an automated deal-finding tool for
-riding mowers and equipment. Here's everything you need to know to pick up where we left off.
+riding mowers and outdoor power equipment. Here's everything you need to know to pick up
+where we left off.
 
 ---
 
 ### What Deal Scout Does
 
-Deal Scout monitors online marketplaces for undervalued zero-turn and riding mowers, scores
-each listing against real eBay sold data to estimate profit potential, and sends SMS + email
-alerts when a deal meets our thresholds. A Next.js dashboard tracks deal status from discovery
-through purchase.
+Deal Scout monitors online marketplaces for undervalued zero-turn mowers, riding mowers,
+and related equipment, scores each listing against real eBay sold data to estimate profit
+potential, and sends SMS + email alerts when a deal meets our thresholds. A Next.js
+dashboard tracks deal status from discovery through purchase.
 
 **Core loop (runs every 30 min via Vercel Cron):**
 1. Scrape Craigslist (8 FL markets) and Facebook Marketplace (via Apify) for listings
@@ -38,7 +39,7 @@ through purchase.
 | Min profit (absolute) | $600 |
 | Min profit (percent) | 20% |
 | Alert channels | SMS via Twilio, Email via Resend |
-| Target category | Zero-turn and riding mowers |
+| Target category | Zero-turn and riding mowers (phase 1) |
 | Min listing price | $500 (filters out push mowers / junk) |
 
 All thresholds live in `.env.local` — no code changes needed to adjust them.
@@ -65,7 +66,7 @@ All thresholds live in `.env.local` — no code changes needed to adjust them.
 deal-scout/
 ├── .env.example                        ← All required env vars documented here
 ├── scripts/
-│   └── test-ebay.ts                    ← Run this first to verify eBay API works
+│   └── test-ebay.ts                    ← Run this to verify eBay API works
 ├── supabase/migrations/
 │   └── 001_initial_schema.sql          ← Run in Supabase SQL Editor to create tables
 └── src/
@@ -121,25 +122,23 @@ A deal **qualifies** (triggers an alert) when ALL three are true:
 
 ---
 
-### eBay API Setup (THE FOUNDATION — do this first)
+### eBay API Status
 
-The pricing model is built on eBay's **Finding API** (findCompletedItems — sold listings only).
+**Credentials: ✅ done** — Production keyset created, keys in `.env.local`
 
-1. Go to https://developer.ebay.com
-2. Sign in with your eBay account
-3. My Account → Application Access Keys → Create App → select **Production**
-4. Copy App ID (Client ID) and Client Secret
-5. Add to `.env.local`:
-   ```
-   EBAY_CLIENT_ID=your_app_id
-   EBAY_CLIENT_SECRET=your_client_secret
-   EBAY_ENVIRONMENT=production
-   ```
-6. Test with: `npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts`
+- App ID (Client ID): in `.env.local` as `EBAY_CLIENT_ID`
+- Cert ID (Client Secret): in `.env.local` as `EBAY_CLIENT_SECRET`
+- Environment: `production`
 
-**Note:** The primary endpoint is the Marketplace Insights API (sold data). If that's
-unavailable on your account tier, the code automatically falls back to findCompletedItems.
-Both are implemented in `src/lib/ebay/client.ts`.
+**Finding API (findCompletedItems):** ✅ auth works, hit rate limit during initial testing
+(new accounts have low call quotas that reset within hours — will be fine in production)
+
+**Marketplace Insights API:** ❌ requires "application growth check" approval from eBay —
+not worth pursuing. The Finding API fallback handles everything we need.
+
+**Exemption filed:** Selected "I do not persist eBay data" — approved, keyset is active.
+
+Test script: `npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts`
 
 ---
 
@@ -201,15 +200,32 @@ curl -X POST https://your-vercel-url.vercel.app/api/cron \
 
 ---
 
+### Category Expansion Plan
+
+Phase 1 (current): Zero-turn and riding mowers
+Phase 2 (planned): Add these high-fit categories — same scraper pattern, new eBay category IDs
+- **Golf carts** — Florida is golf cart country, huge volume in the corridor, strong eBay comps
+- **Utility trailers** — single to tandem axle, easy to evaluate, high Craigslist volume
+- **Commercial pressure washers** — Honda/Kohler engine units, often underpriced, solid comps
+
+Skip for now: push mowers (too cheap), sheds (no eBay comps), consumer generators (thin margins)
+
+Code changes needed for expansion:
+- Add search terms to `SEARCH_QUERIES` in `craigslist.ts`
+- Add eBay category IDs to `EBAY_CATEGORIES` in `ebay/client.ts`
+- Make `fetchSoldComps()` category-aware (currently hardcodes "zero turn mower" in query)
+
+---
+
 ### What Still Needs To Be Done
 
 #### Immediate (before first run)
-- [ ] Get eBay Developer API credentials (developer.ebay.com → My Account → Application Access Keys)
-- [ ] Run `scripts/test-ebay.ts` to confirm eBay API works
+- [x] Get eBay Developer API credentials — done, keys in `.env.local`
+- [x] Run `scripts/test-ebay.ts` — auth confirmed working
 - [ ] Create Supabase project, run `supabase/migrations/001_initial_schema.sql`
+- [ ] Add Supabase keys to `.env.local`
 - [ ] Set up Twilio account, get phone number
 - [ ] Set up Resend account, verify domain, update `from` address in `src/lib/alerts.ts`
-- [ ] Fill out `.env.local` from `.env.example`
 - [ ] Deploy to Vercel: `vercel` CLI or connect GitHub repo
 - [ ] Add all env vars to Vercel environment settings
 - [ ] Set up cron trigger (Vercel Pro or cron-job.org)
@@ -220,7 +236,7 @@ curl -X POST https://your-vercel-url.vercel.app/api/cron \
 - [ ] Notes field in deal detail panel (UI exists, no input yet)
 - [ ] Actual profit tracking UI — input fields for actual_buy_price / actual_sell_price
 - [ ] Deal history / profit summary view
-- [ ] Expand to trailers, ATVs, sheds (same scraper pattern, different search terms + eBay categories)
+- [ ] Category expansion — golf carts, utility trailers, commercial pressure washers
 - [ ] Dealer contact CRM — track which local dealers have used inventory, auto-prompt follow-ups
 - [ ] Inspection sheet — mobile form for drivers, AI-generated renegotiation script from results
 
@@ -234,6 +250,7 @@ curl -X POST https://your-vercel-url.vercel.app/api/cron \
 - **Craigslist always on, Facebook optional** — Apify token presence gates FB scraping
 - **Service role key for cron, anon key for client** — never expose service role to browser
 - **Score saved to DB** — lets you analyze score distribution over time and tune thresholds
+- **Finding API only** — Marketplace Insights requires special eBay approval, not worth it
 
 ---
 
