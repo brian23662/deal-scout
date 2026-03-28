@@ -43,7 +43,7 @@ async function main() {
   })
 
   const searchRes = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
-  const searchData = await searchRes.json()
+  const searchData: any = await searchRes.json()
   const items = searchData?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
   const sold = items.filter((i: any) => i?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales')
 
