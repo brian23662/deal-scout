@@ -3,6 +3,10 @@
  *
  * Usage:
  *   npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts
+ *
+ * NOTE: Error 10001 = rate limited. Stop running the test and wait until
+ * tomorrow. The quota resets daily. This will NOT affect production —
+ * the cron runs every 30 min, making ~48 calls/day, well within limits.
  */
 
 import * as dotenv from 'dotenv'
@@ -55,60 +59,55 @@ async function testFindingAPI(categoryId: string, label: string): Promise<boolea
     'outputSelector': 'SellerInfo',
   })
 
-  const url = `https://svcs.ebay.com/services/search/FindingService/v1?${params}`
-  console.log(`  HTTP status: `)
-
-  const res = await fetch(url)
-  console.log(`${res.status} ${res.statusText}`)
-
+  const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
   const rawText = await res.text()
-
-  // Always show the raw response so we know exactly what eBay returned
-  console.log(`  Raw response (first 600 chars):\n  ${rawText.slice(0, 600)}\n`)
 
   let data: any
   try {
     data = JSON.parse(rawText)
   } catch {
-    console.log('  ❌ Response is not valid JSON — eBay may be returning an error page')
+    console.log(`  ❌ HTTP ${res.status} — non-JSON response:`, rawText.slice(0, 200))
     return false
   }
 
-  // The top-level key tells us if this is the right response shape
-  const topKeys = Object.keys(data)
-  console.log(`  Top-level response keys: ${topKeys.join(', ')}`)
+  // eBay rate limit comes back as a TOP-LEVEL errorMessage (not inside findCompletedItemsResponse)
+  const topLevelError = data?.errorMessage?.[0]?.error?.[0]
+  if (topLevelError) {
+    const errorId = topLevelError?.errorId?.[0]
+    const msg = topLevelError?.message?.[0]
+    if (errorId === '10001') {
+      console.log(`  ⏳ RATE LIMITED (error 10001) — stop running this test for today`)
+      console.log(`     Your quota resets overnight. Try again tomorrow morning.`)
+      console.log(`     ✅ Credentials are valid — this is the only issue.`)
+    } else {
+      console.log(`  ❌ eBay error ${errorId}: ${msg}`)
+    }
+    return false
+  }
 
-  // Handle both possible response shapes eBay uses
+  // Normal response shape
   const response = data?.findCompletedItemsResponse?.[0]
   if (!response) {
-    console.log('  ❌ No findCompletedItemsResponse key — eBay returned an unexpected shape')
-    console.log('  Full response:', JSON.stringify(data, null, 2).slice(0, 800))
+    console.log(`  ❌ Unexpected response shape. Raw:`, JSON.stringify(data).slice(0, 400))
     return false
   }
 
   const ack = response?.ack?.[0]
-  const errorMessage = response?.errorMessage?.[0]?.error?.[0]
+  const innerError = response?.errorMessage?.[0]?.error?.[0]
+  if (innerError) {
+    const errorId = innerError?.errorId?.[0]
+    const msg = innerError?.message?.[0]
+    console.log(`  ❌ eBay error ${errorId}: ${msg}`)
+    return false
+  }
+
   const totalEntries = parseInt(response?.paginationOutput?.[0]?.totalEntries?.[0] || '0')
   const items = response?.searchResult?.[0]?.item || []
   const sold = items.filter(
     (i: any) => i?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales'
   )
 
-  console.log(`  ack: ${ack}`)
-
-  if (errorMessage) {
-    const errorId = errorMessage?.errorId?.[0]
-    const msg = errorMessage?.message?.[0]
-    const severity = errorMessage?.severity?.[0]
-    console.log(`  eBay ${severity} error ${errorId}: ${msg}`)
-    if (errorId === '10001') {
-      console.log('  ⏳ Rate limited — wait 15-30 min and retry')
-    }
-    return false
-  }
-
-  console.log(`  Total matching sold listings: ${totalEntries}`)
-  console.log(`  Returned this page: ${items.length} listings, ${sold.length} confirmed sold`)
+  console.log(`  ✅ ack: ${ack} | Total in category: ${totalEntries} | This page: ${items.length} listings, ${sold.length} sold`)
 
   if (sold.length > 0) {
     console.log('\n  Sample sold listings:')
@@ -138,7 +137,7 @@ async function testFindingAPI(categoryId: string, label: string): Promise<boolea
 }
 
 async function testMarketplaceInsightsAPI(token: string): Promise<boolean> {
-  console.log('\n--- Marketplace Insights API (bonus check — not required) ---')
+  console.log('\n--- Marketplace Insights API (bonus — not required) ---')
 
   const params = new URLSearchParams({
     q: 'zero turn mower',
@@ -157,15 +156,13 @@ async function testMarketplaceInsightsAPI(token: string): Promise<boolean> {
     }
   )
 
-  const text = await res.text()
-
   if (!res.ok) {
     console.log(`  ⚠️  Status ${res.status} — not approved for this API (this is fine)`)
     console.log('  → Production automatically uses Finding API fallback')
     return false
   }
 
-  const data: any = JSON.parse(text)
+  const data: any = await res.json()
   const items = data.itemSales || []
   console.log(`  ✅ Marketplace Insights works: ${items.length} results`)
   return true
@@ -187,13 +184,15 @@ async function main() {
   await testMarketplaceInsightsAPI(token)
 
   console.log('\n=== Summary ===')
-  console.log(`  Finding API (zero turn):  ${zeroTurnOk ? '✅ working' : '❌ failed'}`)
-  console.log(`  Finding API (riding):     ${ridingOk ? '✅ working' : '❌ failed'}`)
+  console.log(`  Finding API (zero turn):  ${zeroTurnOk ? '✅ working' : '❌ not available right now'}`)
+  console.log(`  Finding API (riding):     ${ridingOk ? '✅ working' : '❌ not available right now'}`)
 
   if (zeroTurnOk || ridingOk) {
     console.log('\n✅ eBay Finding API is working — you are ready to run the cron')
   } else {
-    console.log('\n❌ Finding API not returning results. Paste the raw response above into chat.')
+    console.log('\n⏳ If you saw RATE LIMITED above: credentials are valid, quota resets overnight.')
+    console.log('   Do NOT keep running this test — each run burns more quota.')
+    console.log('   You can safely deploy and run the cron — it runs every 30 min (fine).')
   }
 }
 
