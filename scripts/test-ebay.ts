@@ -3,16 +3,11 @@
  *
  * Usage:
  *   npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts
- *
- * NOTE: If you see error 10001 (RateLimiter), you ran this too many times
- * in a short window. Wait 15-30 min and try again. This does NOT affect
- * production — the cron only runs every 30 min, well within quota.
  */
 
 import * as dotenv from 'dotenv'
 dotenv.config({ path: '.env.local' })
 
-// Matches EBAY_CATEGORIES in src/lib/ebay/client.ts
 const ZERO_TURN_CATEGORY = '73340'
 const RIDING_MOWER_CATEGORY = '71280'
 
@@ -43,7 +38,6 @@ async function getToken(): Promise<string> {
 async function testFindingAPI(categoryId: string, label: string): Promise<boolean> {
   console.log(`--- Finding API: ${label} (categoryId: ${categoryId}) ---`)
 
-  // This mirrors exactly what fetchSoldCompsViaFindingAPI() does in production
   const params = new URLSearchParams({
     'OPERATION-NAME': 'findCompletedItems',
     'SERVICE-VERSION': '1.0.0',
@@ -61,34 +55,59 @@ async function testFindingAPI(categoryId: string, label: string): Promise<boolea
     'outputSelector': 'SellerInfo',
   })
 
-  const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
-  const data: any = await res.json()
+  const url = `https://svcs.ebay.com/services/search/FindingService/v1?${params}`
+  console.log(`  HTTP status: `)
 
-  const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0]
-  const totalReturned = parseInt(
-    data?.findCompletedItemsResponse?.[0]?.paginationOutput?.[0]?.totalEntries?.[0] || '0'
-  )
-  const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+  const res = await fetch(url)
+  console.log(`${res.status} ${res.statusText}`)
+
+  const rawText = await res.text()
+
+  // Always show the raw response so we know exactly what eBay returned
+  console.log(`  Raw response (first 600 chars):\n  ${rawText.slice(0, 600)}\n`)
+
+  let data: any
+  try {
+    data = JSON.parse(rawText)
+  } catch {
+    console.log('  ❌ Response is not valid JSON — eBay may be returning an error page')
+    return false
+  }
+
+  // The top-level key tells us if this is the right response shape
+  const topKeys = Object.keys(data)
+  console.log(`  Top-level response keys: ${topKeys.join(', ')}`)
+
+  // Handle both possible response shapes eBay uses
+  const response = data?.findCompletedItemsResponse?.[0]
+  if (!response) {
+    console.log('  ❌ No findCompletedItemsResponse key — eBay returned an unexpected shape')
+    console.log('  Full response:', JSON.stringify(data, null, 2).slice(0, 800))
+    return false
+  }
+
+  const ack = response?.ack?.[0]
+  const errorMessage = response?.errorMessage?.[0]?.error?.[0]
+  const totalEntries = parseInt(response?.paginationOutput?.[0]?.totalEntries?.[0] || '0')
+  const items = response?.searchResult?.[0]?.item || []
   const sold = items.filter(
     (i: any) => i?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales'
   )
 
-  // Check for rate limit or other eBay errors
-  const ebayError = data?.findCompletedItemsResponse?.[0]?.errorMessage?.[0]?.error?.[0]
-  if (ebayError) {
-    const errorId = ebayError?.errorId?.[0]
-    const msg = ebayError?.message?.[0]
+  console.log(`  ack: ${ack}`)
+
+  if (errorMessage) {
+    const errorId = errorMessage?.errorId?.[0]
+    const msg = errorMessage?.message?.[0]
+    const severity = errorMessage?.severity?.[0]
+    console.log(`  eBay ${severity} error ${errorId}: ${msg}`)
     if (errorId === '10001') {
-      console.log(`  ⏳ Rate limited (error 10001) — wait 15-30 min and retry`)
-      console.log(`     This will NOT happen in production (cron runs every 30 min)`)
-    } else {
-      console.log(`  eBay error ${errorId}: ${msg}`)
+      console.log('  ⏳ Rate limited — wait 15-30 min and retry')
     }
     return false
   }
 
-  console.log(`  ack: ${ack}`)
-  console.log(`  Total sold listings in category: ${totalReturned}`)
+  console.log(`  Total matching sold listings: ${totalEntries}`)
   console.log(`  Returned this page: ${items.length} listings, ${sold.length} confirmed sold`)
 
   if (sold.length > 0) {
@@ -165,20 +184,16 @@ async function main() {
   const zeroTurnOk = await testFindingAPI(ZERO_TURN_CATEGORY, 'Zero Turn Mowers')
   console.log()
   const ridingOk = await testFindingAPI(RIDING_MOWER_CATEGORY, 'Riding Mowers')
-  const insightsOk = await testMarketplaceInsightsAPI(token)
+  await testMarketplaceInsightsAPI(token)
 
   console.log('\n=== Summary ===')
-  console.log(`  Finding API (zero turn):  ${zeroTurnOk ? '✅ working' : '⚠️  0 results (rate limit or quota)'}`)
-  console.log(`  Finding API (riding):     ${ridingOk ? '✅ working' : '⚠️  0 results (rate limit or quota)'}`)
-  console.log(`  Marketplace Insights:     ${insightsOk ? '✅ working' : '⚠️  not approved (Finding API fallback active)'}`)
+  console.log(`  Finding API (zero turn):  ${zeroTurnOk ? '✅ working' : '❌ failed'}`)
+  console.log(`  Finding API (riding):     ${ridingOk ? '✅ working' : '❌ failed'}`)
 
   if (zeroTurnOk || ridingOk) {
     console.log('\n✅ eBay Finding API is working — you are ready to run the cron')
   } else {
-    console.log('\n⚠️  Got 0 sold results.')
-    console.log('   If you see "Rate limited" above → wait 15-30 min, then retry')
-    console.log('   Auth is confirmed working, so your credentials are correct.')
-    console.log('   The production cron will work fine — it runs every 30 min, well within quota.')
+    console.log('\n❌ Finding API not returning results. Paste the raw response above into chat.')
   }
 }
 
