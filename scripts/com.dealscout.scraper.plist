@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd schedule for Deal Scout local scraper.
+  Runs every 4 hours on your Mac mini.
+
+  SETUP:
+  1. Edit WorkingDirectory and StandardOutPath/StandardErrorPath below
+     to match your actual project path.
+  2. Copy this file to ~/Library/LaunchAgents/
+     cp scripts/com.dealscout.scraper.plist ~/Library/LaunchAgents/
+  3. Load it:
+     launchctl load ~/Library/LaunchAgents/com.dealscout.scraper.plist
+  4. To unload/stop:
+     launchctl unload ~/Library/LaunchAgents/com.dealscout.scraper.plist
+  5. To run manually right now:
+     launchctl start com.dealscout.scraper
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dealscout.scraper</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/npx</string>
+    <string>ts-node</string>
+    <string>--project</string>
+    <string>tsconfig.scripts.json</string>
+    <string>scripts/local-scraper.ts</string>
+  </array>
+
+  <!-- Edit this to your actual project path -->
+  <key>WorkingDirectory</key>
+  <string>/Users/frahm/deal-scout</string>
+
+  <!-- Run every 4 hours (14400 seconds) -->
+  <key>StartInterval</key>
+  <integer>14400</integer>
+
+  <!-- Log output -->
+  <key>StandardOutPath</key>
+  <string>/Users/frahm/deal-scout/logs/scraper.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/frahm/deal-scout/logs/scraper-error.log</string>
+
+  <!-- Start when loaded, not just on schedule -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

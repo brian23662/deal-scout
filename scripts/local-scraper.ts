@@ -1,0 +1,364 @@
+#!/usr/bin/env npx ts-node
+/**
+ * Deal Scout — Local Scraper
+ * Runs on your Mac mini at home where Craigslist doesn't block requests.
+ * Scrapes all for-sale listings $500+, scores against eBay sold comps,
+ * writes results directly to Supabase.
+ *
+ * Setup:
+ *   1. Copy .env.local to scripts/.env (or set env vars in your shell)
+ *   2. Run manually:  npx ts-node --project tsconfig.scripts.json scripts/local-scraper.ts
+ *   3. Schedule with launchd (see scripts/com.dealscout.scraper.plist)
+ */
+
+import * as cheerio from 'cheerio'
+import { createClient } from '@supabase/supabase-js'
+import * as dotenv from 'dotenv'
+import * as path from 'path'
+
+// Load env from project root .env.local
+dotenv.config({ path: path.resolve(__dirname, '../.env.local') })
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const HOME_LAT = 29.2866
+const HOME_LNG = -81.0559
+const MIN_PRICE = 500
+const MIN_PROFIT_DOLLARS = parseInt(process.env.MIN_PROFIT_DOLLARS || '600')
+const MIN_PROFIT_PERCENT = parseInt(process.env.MIN_PROFIT_PERCENT || '20')
+const MAX_DISTANCE_MILES = parseInt(process.env.MAX_DISTANCE_MILES || '240')
+
+const FL_MARKETS = [
+  { subdomain: 'daytona',      city: 'Daytona Beach',  state: 'FL', lat: 29.2108, lng: -81.0228 },
+  { subdomain: 'orlando',      city: 'Orlando',        state: 'FL', lat: 28.5383, lng: -81.3792 },
+  { subdomain: 'jacksonville', city: 'Jacksonville',   state: 'FL', lat: 30.3322, lng: -81.6557 },
+  { subdomain: 'tampa',        city: 'Tampa',          state: 'FL', lat: 27.9506, lng: -82.4572 },
+  { subdomain: 'lakeland',     city: 'Lakeland',       state: 'FL', lat: 28.0395, lng: -81.9498 },
+  { subdomain: 'gainesville',  city: 'Gainesville',    state: 'FL', lat: 29.6516, lng: -82.3248 },
+  { subdomain: 'ocala',        city: 'Ocala',          state: 'FL', lat: 29.1872, lng: -82.1401 },
+  { subdomain: 'treasure',     city: 'Treasure Coast', state: 'FL', lat: 27.2711, lng: -80.3582 },
+]
+
+// ─── Supabase ─────────────────────────────────────────────────────────────────
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+)
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface Listing {
+  platform: string
+  external_id: string
+  title: string
+  asking_price: number
+  make?: string
+  model?: string
+  hours?: number
+  location_city: string
+  location_state: string
+  distance_miles: number
+  url: string
+  image_urls: string[]
+  posted_at: string
+  scraped_at: string
+}
+
+interface EbayComp {
+  sold_price: number
+  title: string
+}
+
+// ─── Craigslist Scraper ───────────────────────────────────────────────────────
+
+async function scrapeMarket(market: typeof FL_MARKETS[0]): Promise<Listing[]> {
+  const params = new URLSearchParams({
+    min_price: String(MIN_PRICE),
+    sort: 'date',
+  })
+  const url = `https://${market.subdomain}.craigslist.org/search/sss?${params}`
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  })
+
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`)
+
+  const html = await response.text()
+  const $ = cheerio.load(html)
+
+  // Parse JSON-LD results
+  const jsonLdText = $('#ld_searchpage_results').text()
+  if (!jsonLdText) {
+    console.warn(`  No JSON-LD for ${market.subdomain}`)
+    return []
+  }
+
+  const jsonData = JSON.parse(jsonLdText)
+  const items: any[] = jsonData?.itemListElement || []
+
+  // Also grab URLs from anchor tags (JSON-LD omits them)
+  const urls: string[] = []
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || ''
+    if (/\/\d{10}\.html/.test(href)) {
+      const full = href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`
+      if (!urls.includes(full)) urls.push(full)
+    }
+  })
+
+  const listings: Listing[] = []
+  for (let i = 0; i < items.length; i++) {
+    try {
+      const item = items[i]?.item
+      if (!item) continue
+
+      const title: string = item.name || ''
+      const price = parseFloat(item.offers?.price || '0')
+      const images: string[] = Array.isArray(item.image) ? item.image : (item.image ? [item.image] : [])
+      const itemUrl = urls[i] || ''
+
+      if (!price || price < MIN_PRICE) continue
+      if (!itemUrl) continue
+
+      const externalId = itemUrl.match(/\/(\d{10})\.html/)?.[1]
+      if (!externalId) continue
+
+      listings.push({
+        platform: 'craigslist',
+        external_id: externalId,
+        title,
+        asking_price: price,
+        make: extractMake(title),
+        model: extractModel(title),
+        hours: extractHours(title),
+        location_city: market.city,
+        location_state: market.state,
+        distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
+        url: itemUrl,
+        image_urls: images,
+        posted_at: '',
+        scraped_at: new Date().toISOString(),
+      })
+    } catch {}
+  }
+
+  return listings
+}
+
+async function scrapeAllMarkets(): Promise<Listing[]> {
+  const all: Listing[] = []
+  const seen = new Set<string>()
+
+  for (const market of FL_MARKETS) {
+    try {
+      console.log(`  Scraping ${market.subdomain}...`)
+      const listings = await scrapeMarket(market)
+      for (const l of listings) {
+        if (!seen.has(l.url)) {
+          seen.add(l.url)
+          all.push(l)
+        }
+      }
+      console.log(`  ${market.subdomain}: ${listings.length} listings`)
+    } catch (e: any) {
+      console.error(`  ${market.subdomain} error:`, e.message)
+    }
+    await sleep(1500) // be polite between markets
+  }
+
+  return all
+}
+
+// ─── eBay Comps ───────────────────────────────────────────────────────────────
+
+let ebayToken: { token: string; expiresAt: number } | null = null
+
+async function getEbayToken(): Promise<string> {
+  if (ebayToken && Date.now() < ebayToken.expiresAt - 300000) return ebayToken.token
+
+  const credentials = Buffer.from(
+    `${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`
+  ).toString('base64')
+
+  const res = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
+  })
+
+  if (!res.ok) throw new Error(`eBay auth failed: ${await res.text()}`)
+  const data = await res.json()
+  ebayToken = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 }
+  return ebayToken.token
+}
+
+async function fetchSoldComps(title: string, make?: string, model?: string): Promise<EbayComp[]> {
+  const stopWords = new Set(['for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used', 'great', 'condition', 'like', 'works', 'good'])
+  const query = make && model
+    ? `${make} ${model}`
+    : make
+    ? `${make} ${title.split(' ').slice(0, 3).join(' ')}`
+    : title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
+
+  const params = new URLSearchParams({
+    'OPERATION-NAME': 'findCompletedItems',
+    'SERVICE-VERSION': '1.0.0',
+    'SECURITY-APPNAME': process.env.EBAY_CLIENT_ID || '',
+    'RESPONSE-DATA-FORMAT': 'JSON',
+    'REST-PAYLOAD': '',
+    'keywords': query,
+    'itemFilter(0).name': 'SoldItemsOnly',
+    'itemFilter(0).value': 'true',
+    'itemFilter(1).name': 'MinPrice',
+    'itemFilter(1).value': '100',
+    'paginationInput.entriesPerPage': '20',
+    'sortOrder': 'EndTimeSoonest',
+  })
+
+  const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
+  if (!res.ok) return []
+
+  const data = await res.json()
+  if (data?.errorMessage) return []
+
+  const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+  return items
+    .filter((item: any) => item?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales')
+    .map((item: any) => ({
+      sold_price: parseFloat(item.sellingStatus?.[0]?.convertedCurrentPrice?.[0]?.['__value__'] || '0'),
+      title: item.title?.[0] || '',
+    }))
+}
+
+function calculateMarketValue(comps: EbayComp[]): number {
+  const prices = comps.map(c => c.sold_price).filter(p => p > 0).sort((a, b) => a - b)
+  if (prices.length === 0) return 0
+  const mid = Math.floor(prices.length / 2)
+  return Math.round(prices[mid])
+}
+
+// ─── Scoring ──────────────────────────────────────────────────────────────────
+
+function scoreDeal(listing: Listing, comps: EbayComp[]) {
+  const marketValue = calculateMarketValue(comps)
+  const compCount = comps.length
+
+  if (marketValue === 0 || compCount === 0) {
+    return { estimated_market_value: 0, comp_count: 0, profit_potential: 0, profit_percent: 0, deal_score: 0, qualifies: false }
+  }
+
+  const profitPotential = marketValue - listing.asking_price
+  const profitPercent = (profitPotential / marketValue) * 100
+  const qualifies = profitPotential >= MIN_PROFIT_DOLLARS && profitPercent >= MIN_PROFIT_PERCENT && listing.distance_miles <= MAX_DISTANCE_MILES
+
+  const score = Math.round(
+    Math.min((profitPercent / 50) * 40, 40) +
+    Math.min((profitPotential / 2000) * 40, 40) +
+    Math.min((compCount / 20) * 20, 20)
+  )
+
+  return {
+    estimated_market_value: marketValue,
+    comp_count: compCount,
+    profit_potential: Math.round(profitPotential),
+    profit_percent: Math.round(profitPercent * 10) / 10,
+    deal_score: score,
+    qualifies,
+  }
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('🔍 Deal Scout local scraper starting...')
+  console.log(`   Min price: $${MIN_PRICE} | Min profit: $${MIN_PROFIT_DOLLARS} / ${MIN_PROFIT_PERCENT}%`)
+
+  const results = { scraped: 0, scored: 0, qualified: 0, skipped: 0, errors: 0 }
+
+  console.log('\n📡 Scraping Craigslist markets...')
+  const listings = await scrapeAllMarkets()
+  results.scraped = listings.length
+  console.log(`\n✅ Scraped ${listings.length} listings total`)
+
+  console.log('\n📊 Scoring against eBay comps...')
+  for (const listing of listings) {
+    try {
+      // Dedup check
+      const { data: existing } = await supabase
+        .from('scored_deals').select('id')
+        .eq('platform', listing.platform)
+        .eq('external_id', listing.external_id)
+        .single()
+
+      if (existing) { results.skipped++; continue }
+
+      // Fetch eBay comps
+      const comps = await fetchSoldComps(listing.title, listing.make, listing.model)
+      const score = scoreDeal(listing, comps)
+      results.scored++
+
+      // Save to Supabase
+      const { error } = await supabase.from('scored_deals').insert({
+        platform: listing.platform,
+        external_id: listing.external_id,
+        title: listing.title,
+        asking_price: listing.asking_price,
+        make: listing.make,
+        model: listing.model,
+        hours: listing.hours,
+        location_city: listing.location_city,
+        location_state: listing.location_state,
+        distance_miles: listing.distance_miles,
+        url: listing.url,
+        image_urls: listing.image_urls,
+        posted_at: listing.posted_at || null,
+        ...score,
+        status: 'new',
+        alert_sent: false,
+      })
+
+      if (error) {
+        console.error(`  DB error for ${listing.external_id}:`, error.message)
+        results.errors++
+        continue
+      }
+
+      if (score.qualifies) {
+        results.qualified++
+        console.log(`  🔥 DEAL: ${listing.title} — $${score.profit_potential} profit (${score.profit_percent}%)`)
+      }
+
+      await sleep(300) // be polite to eBay API
+    } catch (e: any) {
+      console.error(`  Error scoring ${listing.external_id}:`, e.message)
+      results.errors++
+    }
+  }
+
+  console.log('\n✅ Done!', results)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+
+function getDistanceMiles(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 3959
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLng = (lng2 - lng1) * Math.PI / 180
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) * Math.sin(dLng/2)**2
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)))
+}
+
+const BRANDS = ['Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity', 'Club Car', 'EZGO', 'Yamaha']
+function extractMake(t: string) { return BRANDS.find(b => t.toUpperCase().includes(b.toUpperCase())) }
+function extractModel(t: string) { return t.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+)\b/i)?.[0] }
+function extractHours(t: string) { const m = t.match(/(\d+)\s*(?:hours?|hrs?)/i); return m ? parseInt(m[1]) : undefined }
+
+main().catch(console.error)
