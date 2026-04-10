@@ -14,6 +14,17 @@ export async function GET() {
   const html = await response.text()
   const $ = cheerio.load(html)
 
+  // Extract URLs from anchor tags
+  const urlsFromHtml: string[] = []
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || ''
+    if (/\/\d{10}\.html/.test(href)) {
+      const full = href.startsWith('http') ? href : `https://daytona.craigslist.org${href}`
+      if (!urlsFromHtml.includes(full)) urlsFromHtml.push(full)
+    }
+  })
+
+  // Parse JSON-LD
   const jsonLdText = $('#ld_searchpage_results').text()
   let parsedItems: any[] = []
   let parseError = null
@@ -29,11 +40,12 @@ export async function GET() {
 
   return NextResponse.json({
     status: response.status,
-    url,
     jsonLdFound: !!jsonLdText,
-    jsonLdLength: jsonLdText?.length || 0,
     itemCount: parsedItems.length,
+    urlsFoundInHtml: urlsFromHtml.length,
+    urlSample: urlsFromHtml.slice(0, 3),
     parseError,
-    firstItem, // full structure of the first listing so we can see field names
+    firstItemTitle: firstItem?.item?.name,
+    firstItemPrice: firstItem?.item?.offers?.price,
   })
 }
