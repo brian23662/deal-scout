@@ -1,39 +1,40 @@
 import { NextResponse } from 'next/server'
 
 export async function GET() {
-  // Test Craigslist's internal JSON search API
-  const params = new URLSearchParams({
-    query: 'riding mower',
-    min_price: '500',
-    sort: 'date',
-    start: '0',
-    limit: '5',
-    cc: 'US',
-    lang: 'en',
-  })
-
-  const url = `https://daytona.craigslist.org/search/api/v6/__isapi_search.api.json?${params}&cat=grd`
+  // Test Craigslist RSS feed - stable, always includes full URLs, titles, prices
+  const url = 'https://daytona.craigslist.org/search/grd?query=riding+mower&min_price=500&sort=date&format=rss'
 
   const response = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Referer': 'https://daytona.craigslist.org/',
+      'Accept': 'application/rss+xml, application/xml, text/xml, */*',
     },
   })
 
   const text = await response.text()
-  let parsed: any = null
-  try { parsed = JSON.parse(text) } catch {}
+
+  // Extract a sample of items from the RSS XML
+  const items = text.match(/<item>[\s\S]*?<\/item>/g) || []
+  const firstItem = items[0] || ''
+
+  // Pull out key fields from first item
+  const title = firstItem.match(/<title>(.*?)<\/title>/)?.[1] || ''
+  const link = firstItem.match(/<link>(.*?)<\/link>/)?.[1] ||
+               firstItem.match(/<link\s*\/?>([^<]+)/)?.[1] || ''
+  const price = firstItem.match(/\$[\d,]+/)?.[0] || ''
+  const enclosure = firstItem.match(/enclosure[^>]*url="([^"]+)"/)?.[1] || ''
 
   return NextResponse.json({
     status: response.status,
     url,
-    rawSnippet: text.substring(0, 1000),
-    parsed: parsed ? {
-      totalCount: parsed.data?.totalCount,
-      itemCount: parsed.data?.items?.length,
-      firstItem: parsed.data?.items?.[0],
-    } : null,
+    isXml: text.startsWith('<?xml') || text.includes('<rss'),
+    totalItems: items.length,
+    firstItem: {
+      title,
+      link,
+      price,
+      imageUrl: enclosure,
+      rawSnippet: firstItem.substring(0, 500),
+    },
   })
 }
