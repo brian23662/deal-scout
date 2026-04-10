@@ -6,9 +6,8 @@
  * writes results directly to Supabase.
  *
  * Setup:
- *   1. Copy .env.local to scripts/.env (or set env vars in your shell)
- *   2. Run manually:  npx ts-node --project tsconfig.scripts.json scripts/local-scraper.ts
- *   3. Schedule with launchd (see scripts/com.dealscout.scraper.plist)
+ *   1. Run manually:  npx ts-node --project tsconfig.scripts.json scripts/local-scraper.ts
+ *   2. Schedule with launchd (see scripts/com.dealscout.scraper.plist)
  */
 
 import * as cheerio from 'cheerio'
@@ -73,10 +72,7 @@ interface EbayComp {
 // ─── Craigslist Scraper ───────────────────────────────────────────────────────
 
 async function scrapeMarket(market: typeof FL_MARKETS[0]): Promise<Listing[]> {
-  const params = new URLSearchParams({
-    min_price: String(MIN_PRICE),
-    sort: 'date',
-  })
+  const params = new URLSearchParams({ min_price: String(MIN_PRICE), sort: 'date' })
   const url = `https://${market.subdomain}.craigslist.org/search/sss?${params}`
 
   const response = await fetch(url, {
@@ -160,16 +156,13 @@ async function scrapeAllMarkets(): Promise<Listing[]> {
       console.log(`  Scraping ${market.subdomain}...`)
       const listings = await scrapeMarket(market)
       for (const l of listings) {
-        if (!seen.has(l.url)) {
-          seen.add(l.url)
-          all.push(l)
-        }
+        if (!seen.has(l.url)) { seen.add(l.url); all.push(l) }
       }
       console.log(`  ${market.subdomain}: ${listings.length} listings`)
     } catch (e: any) {
       console.error(`  ${market.subdomain} error:`, e.message)
     }
-    await sleep(1500) // be polite between markets
+    await sleep(1500)
   }
 
   return all
@@ -193,7 +186,7 @@ async function getEbayToken(): Promise<string> {
   })
 
   if (!res.ok) throw new Error(`eBay auth failed: ${await res.text()}`)
-  const data = await res.json()
+  const data = await res.json() as any  // cast to any — eBay token response
   ebayToken = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 }
   return ebayToken.token
 }
@@ -224,10 +217,10 @@ async function fetchSoldComps(title: string, make?: string, model?: string): Pro
   const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
   if (!res.ok) return []
 
-  const data = await res.json()
+  const data = await res.json() as any  // cast to any — eBay Finding API response
   if (data?.errorMessage) return []
 
-  const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+  const items: any[] = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
   return items
     .filter((item: any) => item?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales')
     .map((item: any) => ({
@@ -239,8 +232,7 @@ async function fetchSoldComps(title: string, make?: string, model?: string): Pro
 function calculateMarketValue(comps: EbayComp[]): number {
   const prices = comps.map(c => c.sold_price).filter(p => p > 0).sort((a, b) => a - b)
   if (prices.length === 0) return 0
-  const mid = Math.floor(prices.length / 2)
-  return Math.round(prices[mid])
+  return Math.round(prices[Math.floor(prices.length / 2)])
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
@@ -289,7 +281,6 @@ async function main() {
   console.log('\n📊 Scoring against eBay comps...')
   for (const listing of listings) {
     try {
-      // Dedup check
       const { data: existing } = await supabase
         .from('scored_deals').select('id')
         .eq('platform', listing.platform)
@@ -298,12 +289,10 @@ async function main() {
 
       if (existing) { results.skipped++; continue }
 
-      // Fetch eBay comps
       const comps = await fetchSoldComps(listing.title, listing.make, listing.model)
       const score = scoreDeal(listing, comps)
       results.scored++
 
-      // Save to Supabase
       const { error } = await supabase.from('scored_deals').insert({
         platform: listing.platform,
         external_id: listing.external_id,
@@ -323,18 +312,14 @@ async function main() {
         alert_sent: false,
       })
 
-      if (error) {
-        console.error(`  DB error for ${listing.external_id}:`, error.message)
-        results.errors++
-        continue
-      }
+      if (error) { console.error(`  DB error for ${listing.external_id}:`, error.message); results.errors++; continue }
 
       if (score.qualifies) {
         results.qualified++
         console.log(`  🔥 DEAL: ${listing.title} — $${score.profit_potential} profit (${score.profit_percent}%)`)
       }
 
-      await sleep(300) // be polite to eBay API
+      await sleep(300)
     } catch (e: any) {
       console.error(`  Error scoring ${listing.external_id}:`, e.message)
       results.errors++
