@@ -1,7 +1,7 @@
 /**
  * Craigslist scraper for Florida markets within 240 miles of Ormond Beach
  * Parses listing data from the JSON-LD script tag (ld_searchpage_results)
- * Craigslist now embeds all listing data as structured JSON rather than HTML elements
+ * URLs are extracted from HTML anchor tags and matched to JSON-LD items by index
  */
 
 import * as cheerio from 'cheerio'
@@ -51,9 +51,9 @@ export async function scrapeCraigslist(): Promise<Listing[]> {
 
 async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promise<Listing[]> {
   const params = new URLSearchParams({ query, min_price: String(MIN_PRICE), sort: 'date' })
-  const url = `https://${market.subdomain}.craigslist.org/search/grd?${params}`
+  const searchUrl = `https://${market.subdomain}.craigslist.org/search/grd?${params}`
 
-  const response = await fetch(url, {
+  const response = await fetch(searchUrl, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -61,12 +61,23 @@ async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promis
     },
   })
 
-  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`)
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${searchUrl}`)
 
   const html = await response.text()
   const $ = cheerio.load(html)
 
-  // Craigslist now embeds all listing data as JSON-LD in a script tag
+  // Extract all listing URLs from <a> tags pointing to .html listing pages
+  // These appear in order matching the JSON-LD itemListElement array
+  const urlsFromHtml: string[] = []
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || ''
+    if (/\/\d{10}\.html/.test(href)) {
+      const full = href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`
+      if (!urlsFromHtml.includes(full)) urlsFromHtml.push(full)
+    }
+  })
+
+  // Parse JSON-LD listing data
   const jsonLdText = $('#ld_searchpage_results').text()
   if (!jsonLdText) {
     console.warn(`No JSON-LD found for ${market.subdomain} / ${query}`)
@@ -84,20 +95,21 @@ async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promis
   const items: any[] = jsonData?.itemListElement || []
   const listings: Listing[] = []
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
     try {
-      const listing = item?.item
+      const listing = items[i]?.item
       if (!listing) continue
 
       const title: string = listing.name || ''
-      const itemUrl: string = listing.url || ''
-      const priceSpec = listing.offers?.priceSpecification || listing.offers || {}
-      const price = parseFloat(priceSpec.price || priceSpec.lowPrice || '0')
-      const postedAt: string = listing.datePosted || ''
+      const price = parseFloat(listing.offers?.price || '0')
       const images: string[] = Array.isArray(listing.image) ? listing.image : (listing.image ? [listing.image] : [])
+
+      // Match URL by index — JSON-LD items and HTML anchors appear in the same order
+      const itemUrl = urlsFromHtml[i] || ''
 
       if (!price || price < MIN_PRICE) continue
       if (!isRelevantListing(title)) continue
+      if (!itemUrl) continue
 
       const externalId = extractCraigslistId(itemUrl)
       if (!externalId) continue
@@ -115,7 +127,7 @@ async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promis
         distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
         url: itemUrl,
         image_urls: images,
-        posted_at: postedAt,
+        posted_at: '',
         scraped_at: new Date().toISOString(),
       })
     } catch (e) { /* skip malformed items */ }
