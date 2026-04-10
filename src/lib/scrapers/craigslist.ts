@@ -1,8 +1,7 @@
 /**
- * Craigslist scraper via Apify actor
+ * Craigslist scraper via Apify actor (automation-lab~craigslist-scraper)
  * Direct scraping is blocked by Craigslist (403 on RSS, no public API)
- * Using automation-lab/craigslist-scraper on Apify — ~$0.0003/listing
- * Requires APIFY_API_TOKEN in environment
+ * Cost: ~$0.0003/listing. Requires APIFY_API_TOKEN in environment.
  */
 
 import { Listing } from '@/types'
@@ -27,15 +26,16 @@ const FL_MARKETS = [
 const SEARCH_QUERIES = ['zero turn mower', 'riding mower', 'zero turn', 'lawn tractor']
 const MIN_PRICE = 500
 
+// Actual field names returned by automation-lab~craigslist-scraper
 interface ApifyCLItem {
+  listingId?: string
   title?: string
-  price?: string | number
+  price?: string        // e.g. "$650"
+  priceNumeric?: number // e.g. 650
   url?: string
-  location?: string
-  images?: string[]
-  imageUrl?: string
-  date?: string
-  id?: string
+  imageUrls?: string[]
+  postedAt?: string
+  city?: string
 }
 
 export async function scrapeCraigslist(): Promise<Listing[]> {
@@ -62,7 +62,6 @@ export async function scrapeCraigslist(): Promise<Listing[]> {
       } catch (e) {
         console.error(`CL Apify ${market.subdomain}/${query} error:`, e)
       }
-      // Small delay between actor runs to avoid hammering Apify
       await new Promise(r => setTimeout(r, 500))
     }
   }
@@ -71,7 +70,6 @@ export async function scrapeCraigslist(): Promise<Listing[]> {
 }
 
 async function runApifyActor(token: string, subdomain: string, query: string): Promise<ApifyCLItem[]> {
-  // Run actor synchronously and get results in one call
   const response = await fetch(
     `${APIFY_BASE}/acts/${CL_ACTOR_ID}/run-sync-get-dataset-items?token=${token}&timeout=60&memory=256`,
     {
@@ -97,10 +95,8 @@ async function runApifyActor(token: string, subdomain: string, query: string): P
 
 function mapItem(item: ApifyCLItem, market: typeof FL_MARKETS[0]): Listing | null {
   const title = item.title || ''
-  const priceRaw = item.price
-  const price = typeof priceRaw === 'number'
-    ? priceRaw
-    : parseFloat(String(priceRaw || '').replace(/[^0-9.]/g, ''))
+  // Use priceNumeric directly — it's already a clean number
+  const price = item.priceNumeric ?? parseFloat(String(item.price || '').replace(/[^0-9.]/g, ''))
 
   if (!price || price < MIN_PRICE) return null
   if (!isRelevantListing(title)) return null
@@ -108,7 +104,7 @@ function mapItem(item: ApifyCLItem, market: typeof FL_MARKETS[0]): Listing | nul
   const url = item.url || ''
   if (!url) return null
 
-  const externalId = extractCraigslistId(url) || item.id || url
+  const externalId = extractCraigslistId(url) || item.listingId || url
 
   return {
     platform: 'craigslist',
@@ -122,8 +118,8 @@ function mapItem(item: ApifyCLItem, market: typeof FL_MARKETS[0]): Listing | nul
     location_state: market.state,
     distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
     url,
-    image_urls: item.images || (item.imageUrl ? [item.imageUrl] : []),
-    posted_at: item.date || '',
+    image_urls: item.imageUrls || [],
+    posted_at: item.postedAt || '',
     scraped_at: new Date().toISOString(),
   }
 }
