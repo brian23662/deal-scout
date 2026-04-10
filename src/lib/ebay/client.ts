@@ -1,9 +1,8 @@
 /**
  * eBay Finding API client
  * Fetches SOLD listings as market value comps
- *
- * Setup: https://developer.ebay.com
- * Create a Production app -> get Client ID and Client Secret
+ * Now title-driven: builds search query from listing title words
+ * so it works for any category (mowers, golf carts, trailers, tools, etc.)
  */
 
 import { EbayComp, EbayToken } from '@/types'
@@ -11,18 +10,6 @@ import { EbayComp, EbayToken } from '@/types'
 const EBAY_BASE_URL = process.env.EBAY_ENVIRONMENT === 'sandbox'
   ? 'https://api.sandbox.ebay.com'
   : 'https://api.ebay.com'
-
-export const EBAY_CATEGORIES = {
-  ZERO_TURN_MOWERS: '73340',
-  RIDING_MOWERS: '71280',
-  LAWN_TRACTORS: '46308',
-  COMMERCIAL_MOWERS: '42292',
-} as const
-
-export const TARGET_BRANDS = [
-  'Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota',
-  'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity',
-] as const
 
 let cachedToken: { token: string; expiresAt: number } | null = null
 
@@ -50,53 +37,33 @@ export async function getEbayToken(): Promise<string> {
 }
 
 /**
- * Fetch sold eBay listings for market value comps
- * Primary: Marketplace Insights API
- * Fallback: Finding API (findCompletedItems)
+ * Build an eBay search query from a listing title.
+ * Extracts the most meaningful 4-5 words so we get relevant comps
+ * regardless of category (mowers, golf carts, trailers, tools, etc.)
  */
-export async function fetchSoldComps(make: string, model?: string, limit = 20): Promise<EbayComp[]> {
-  const token = await getEbayToken()
-  const query = model ? `${make} ${model} zero turn mower` : `${make} zero turn riding mower`
+export function buildEbayQuery(title: string, make?: string, model?: string): string {
+  if (make && model) return `${make} ${model}`
+  if (make) return `${make} ${title.split(' ').slice(0, 3).join(' ')}`
 
-  const params = new URLSearchParams({
-    q: query,
-    category_ids: EBAY_CATEGORIES.ZERO_TURN_MOWERS,
-    limit: String(limit),
-    filter: 'buyingOptions:{FIXED_PRICE},conditionIds:{3000}',
-  })
+  // Strip common filler words and take the first 5 meaningful words
+  const stopWords = new Set(['for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used', 'great', 'condition', 'like', 'works', 'good'])
+  const words = title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !stopWords.has(w))
+    .slice(0, 5)
 
-  const response = await fetch(
-    `${EBAY_BASE_URL}/buy/marketplace_insights/v1_beta/item_sales/search?${params}`,
-    {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-        'Content-Type': 'application/json',
-      },
-    }
-  )
-
-  if (!response.ok) {
-    console.error('eBay Marketplace Insights error, falling back to Finding API')
-    return fetchSoldCompsViaFindingAPI(make, model, limit)
-  }
-
-  const data = await response.json()
-  return (data.itemSales || []).map((item: any): EbayComp => ({
-    ebay_item_id: item.itemId,
-    title: item.title,
-    make: extractMake(item.title),
-    model: extractModel(item.title),
-    hours: extractHours(item.title + ' ' + (item.shortDescription || '')),
-    condition: item.condition?.conditionDisplayName || 'Used',
-    sold_price: parseFloat(item.lastSoldPrice?.value || '0'),
-    sold_date: item.lastSoldDate || new Date().toISOString(),
-    url: item.itemWebUrl,
-  }))
+  return words.join(' ')
 }
 
-export async function fetchSoldCompsViaFindingAPI(make: string, model?: string, limit = 20): Promise<EbayComp[]> {
-  const query = model ? `${make} ${model} zero turn` : `${make} zero turn mower`
+/**
+ * Fetch sold eBay listings for market value comps
+ * Uses Finding API (findCompletedItems) — no special approval required
+ */
+export async function fetchSoldComps(make: string | undefined, model: string | undefined, limit = 20, title?: string): Promise<EbayComp[]> {
+  const query = buildEbayQuery(title || make || 'used equipment', make, model)
+  console.log(`eBay query: "${query}" for listing: "${title?.substring(0, 50)}"`)
 
   const params = new URLSearchParams({
     'OPERATION-NAME': 'findCompletedItems',
@@ -105,20 +72,24 @@ export async function fetchSoldCompsViaFindingAPI(make: string, model?: string, 
     'RESPONSE-DATA-FORMAT': 'JSON',
     'REST-PAYLOAD': '',
     'keywords': query,
-    'categoryId': EBAY_CATEGORIES.ZERO_TURN_MOWERS,
     'itemFilter(0).name': 'SoldItemsOnly',
     'itemFilter(0).value': 'true',
     'itemFilter(1).name': 'MinPrice',
-    'itemFilter(1).value': '500',
+    'itemFilter(1).value': '100',
     'paginationInput.entriesPerPage': String(limit),
     'sortOrder': 'EndTimeSoonest',
-    'outputSelector': 'SellerInfo',
   })
 
   const response = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
   if (!response.ok) throw new Error(`eBay Finding API error: ${response.statusText}`)
 
   const data = await response.json()
+
+  // Handle rate limit error shape
+  if (data?.errorMessage) {
+    throw new Error(`eBay API error: ${JSON.stringify(data.errorMessage)}`)
+  }
+
   const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
 
   return items
@@ -157,20 +128,17 @@ export function calculateMarketValue(comps: EbayComp[]): {
   }
 }
 
+const TARGET_BRANDS = ['Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity', 'Club Car', 'EZGO', 'Yamaha', 'Big Tex', 'Load Trail']
+
 function extractMake(title: string): string | undefined {
-  const upper = title.toUpperCase()
-  for (const brand of TARGET_BRANDS) {
-    if (upper.includes(brand.toUpperCase())) return brand
-  }
-  return undefined
+  return TARGET_BRANDS.find(b => title.toUpperCase().includes(b.toUpperCase()))
 }
 
 function extractModel(title: string): string | undefined {
-  const match = title.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+|\d{2,3}"-?\d{0,2})\b/i)
-  return match?.[0] || undefined
+  return title.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+)\b/i)?.[0]
 }
 
 function extractHours(text: string): number | undefined {
-  const match = text.match(/(\d+)\s*(?:hours?|hrs?)/i)
-  return match ? parseInt(match[1]) : undefined
+  const m = text.match(/(\d+)\s*(?:hours?|hrs?)/i)
+  return m ? parseInt(m[1]) : undefined
 }

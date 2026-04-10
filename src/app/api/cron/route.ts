@@ -1,6 +1,11 @@
 /**
- * POST /api/cron - Main orchestration, runs every 30 min via Vercel Cron
+ * POST /api/cron - Main orchestration
+ * Triggered every 4 hours via cron-job.org (free alternative to Vercel Cron)
  * Secured with x-cron-secret header
+ *
+ * Price-driven approach: scrapes all for-sale listings above $500,
+ * scores each against eBay sold comps. No category filtering needed —
+ * low-comp items naturally score low and don't trigger alerts.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -23,11 +28,11 @@ export async function POST(req: NextRequest) {
   try {
     const allListings: Listing[] = []
 
-    // Craigslist (always on)
+    // Craigslist via Apify (price-driven, all categories)
     try {
       const clListings = await scrapeCraigslist()
       allListings.push(...clListings)
-      console.log(`Craigslist: ${clListings.length} listings`)
+      console.log(`Craigslist total: ${clListings.length} listings`)
     } catch (e: any) { results.errors.push(`Craigslist: ${e.message}`) }
 
     // Facebook via Apify (when token present)
@@ -41,6 +46,7 @@ export async function POST(req: NextRequest) {
     }
 
     results.scraped = allListings.length
+    console.log(`Total listings to score: ${allListings.length}`)
 
     for (const listing of allListings) {
       try {
@@ -50,8 +56,8 @@ export async function POST(req: NextRequest) {
           .eq('platform', listing.platform).eq('external_id', listing.external_id).single()
         if (existing) continue
 
-        // Score against eBay comps
-        const comps = await fetchSoldComps(listing.make || 'zero turn mower', listing.model, 20)
+        // Score against eBay comps — pass full title for smart query building
+        const comps = await fetchSoldComps(listing.make, listing.model, 20, listing.title)
         const score = scoreDeal(listing, comps)
         results.scored++
 
@@ -80,7 +86,7 @@ export async function POST(req: NextRequest) {
           console.log(`🔥 Alert: ${listing.title} - $${score.profit_potential} profit`)
         }
 
-        await new Promise(r => setTimeout(r, 500))
+        await new Promise(r => setTimeout(r, 300))
       } catch (e: any) { results.errors.push(`Scoring ${listing.external_id}: ${e.message}`) }
     }
   } catch (e: any) { results.errors.push(`Fatal: ${e.message}`) }
