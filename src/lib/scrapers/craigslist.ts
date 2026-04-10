@@ -1,6 +1,7 @@
 /**
  * Craigslist scraper for Florida markets within 240 miles of Ormond Beach
- * No login required, simple HTML structure, stable URL patterns
+ * Parses listing data from the JSON-LD script tag (ld_searchpage_results)
+ * Craigslist now embeds all listing data as structured JSON rather than HTML elements
  */
 
 import * as cheerio from 'cheerio'
@@ -64,23 +65,42 @@ async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promis
 
   const html = await response.text()
   const $ = cheerio.load(html)
+
+  // Craigslist now embeds all listing data as JSON-LD in a script tag
+  const jsonLdText = $('#ld_searchpage_results').text()
+  if (!jsonLdText) {
+    console.warn(`No JSON-LD found for ${market.subdomain} / ${query}`)
+    return []
+  }
+
+  let jsonData: any
+  try {
+    jsonData = JSON.parse(jsonLdText)
+  } catch (e) {
+    console.error(`Failed to parse JSON-LD for ${market.subdomain}:`, e)
+    return []
+  }
+
+  const items: any[] = jsonData?.itemListElement || []
   const listings: Listing[] = []
 
-  $('li.cl-search-result').each((_, el) => {
+  for (const item of items) {
     try {
-      const $el = $(el)
-      const title = $el.find('.posting-title .label').text().trim()
-      const priceText = $el.find('.priceinfo').text().trim()
-      const price = parsePrice(priceText)
-      const href = $el.find('a.posting-title').attr('href') || ''
-      const postedAt = $el.find('time').attr('datetime') || ''
-      const imageUrl = $el.find('img').attr('src') || undefined
+      const listing = item?.item
+      if (!listing) continue
 
-      if (!price || price < MIN_PRICE) return
-      if (!isRelevantListing(title)) return
+      const title: string = listing.name || ''
+      const itemUrl: string = listing.url || ''
+      const priceSpec = listing.offers?.priceSpecification || listing.offers || {}
+      const price = parseFloat(priceSpec.price || priceSpec.lowPrice || '0')
+      const postedAt: string = listing.datePosted || ''
+      const images: string[] = Array.isArray(listing.image) ? listing.image : (listing.image ? [listing.image] : [])
 
-      const externalId = extractCraigslistId(href)
-      if (!externalId) return
+      if (!price || price < MIN_PRICE) continue
+      if (!isRelevantListing(title)) continue
+
+      const externalId = extractCraigslistId(itemUrl)
+      if (!externalId) continue
 
       listings.push({
         platform: 'craigslist',
@@ -93,20 +113,15 @@ async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promis
         location_city: market.city,
         location_state: market.state,
         distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
-        url: href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`,
-        image_urls: imageUrl ? [imageUrl] : [],
+        url: itemUrl,
+        image_urls: images,
         posted_at: postedAt,
         scraped_at: new Date().toISOString(),
       })
-    } catch (e) { /* skip malformed */ }
-  })
+    } catch (e) { /* skip malformed items */ }
+  }
 
   return listings
-}
-
-function parsePrice(text: string): number {
-  const match = text.match(/\$?([\d,]+)/)
-  return match ? parseInt(match[1].replace(/,/g, '')) : 0
 }
 
 function extractCraigslistId(href: string): string | undefined {
