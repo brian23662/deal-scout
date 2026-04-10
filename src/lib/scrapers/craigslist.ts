@@ -1,12 +1,17 @@
 /**
- * Craigslist scraper for Florida markets within 240 miles of Ormond Beach
- * Parses listing data from the JSON-LD script tag (ld_searchpage_results)
- * URLs are extracted from HTML anchor tags and matched to JSON-LD items by index
+ * Craigslist scraper via Apify actor
+ * Direct scraping is blocked by Craigslist (403 on RSS, no public API)
+ * Using automation-lab/craigslist-scraper on Apify — ~$0.0003/listing
+ * Requires APIFY_API_TOKEN in environment
  */
 
-import * as cheerio from 'cheerio'
 import { Listing } from '@/types'
 import { getDistanceMiles } from '@/lib/geo'
+
+const HOME_LAT = 29.2866
+const HOME_LNG = -81.0559
+const APIFY_BASE = 'https://api.apify.com/v2'
+const CL_ACTOR_ID = 'automation-lab~craigslist-scraper'
 
 const FL_MARKETS = [
   { subdomain: 'daytona', city: 'Daytona Beach', state: 'FL', lat: 29.2108, lng: -81.0228 },
@@ -19,121 +24,108 @@ const FL_MARKETS = [
   { subdomain: 'treasure', city: 'Treasure Coast', state: 'FL', lat: 27.2711, lng: -80.3582 },
 ]
 
-const HOME_LAT = 29.2866
-const HOME_LNG = -81.0559
+const SEARCH_QUERIES = ['zero turn mower', 'riding mower', 'zero turn', 'lawn tractor']
 const MIN_PRICE = 500
 
-const SEARCH_QUERIES = ['zero turn mower', 'riding mower', 'zero turn', 'lawn tractor']
+interface ApifyCLItem {
+  title?: string
+  price?: string | number
+  url?: string
+  location?: string
+  images?: string[]
+  imageUrl?: string
+  date?: string
+  id?: string
+}
 
 export async function scrapeCraigslist(): Promise<Listing[]> {
+  const token = process.env.APIFY_API_TOKEN
+  if (!token) {
+    console.warn('APIFY_API_TOKEN not set — skipping Craigslist scrape')
+    return []
+  }
+
   const allListings: Listing[] = []
   const seen = new Set<string>()
 
   for (const market of FL_MARKETS) {
     for (const query of SEARCH_QUERIES) {
       try {
-        const listings = await scrapeMarket(market, query)
-        for (const listing of listings) {
-          if (!seen.has(listing.url)) {
-            seen.add(listing.url)
-            allListings.push(listing)
-          }
+        const items = await runApifyActor(token, market.subdomain, query)
+        for (const item of items) {
+          const listing = mapItem(item, market)
+          if (!listing) continue
+          if (seen.has(listing.url)) continue
+          seen.add(listing.url)
+          allListings.push(listing)
         }
-        await new Promise(r => setTimeout(r, 1000))
       } catch (e) {
-        console.error(`Craigslist ${market.subdomain} error:`, e)
+        console.error(`CL Apify ${market.subdomain}/${query} error:`, e)
       }
+      // Small delay between actor runs to avoid hammering Apify
+      await new Promise(r => setTimeout(r, 500))
     }
   }
 
   return allListings
 }
 
-async function scrapeMarket(market: typeof FL_MARKETS[0], query: string): Promise<Listing[]> {
-  const params = new URLSearchParams({ query, min_price: String(MIN_PRICE), sort: 'date' })
-  const searchUrl = `https://${market.subdomain}.craigslist.org/search/grd?${params}`
-
-  const response = await fetch(searchUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-    },
-  })
-
-  if (!response.ok) throw new Error(`HTTP ${response.status} for ${searchUrl}`)
-
-  const html = await response.text()
-  const $ = cheerio.load(html)
-
-  // Extract all listing URLs from <a> tags pointing to .html listing pages
-  // These appear in order matching the JSON-LD itemListElement array
-  const urlsFromHtml: string[] = []
-  $('a[href]').each((_, el) => {
-    const href = $(el).attr('href') || ''
-    if (/\/\d{10}\.html/.test(href)) {
-      const full = href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`
-      if (!urlsFromHtml.includes(full)) urlsFromHtml.push(full)
+async function runApifyActor(token: string, subdomain: string, query: string): Promise<ApifyCLItem[]> {
+  // Run actor synchronously and get results in one call
+  const response = await fetch(
+    `${APIFY_BASE}/acts/${CL_ACTOR_ID}/run-sync-get-dataset-items?token=${token}&timeout=60&memory=256`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        city: subdomain,
+        category: 'for_sale',
+        searchQuery: query,
+        minPrice: MIN_PRICE,
+        maxResults: 40,
+        includeDetails: false,
+      }),
     }
-  })
+  )
 
-  // Parse JSON-LD listing data
-  const jsonLdText = $('#ld_searchpage_results').text()
-  if (!jsonLdText) {
-    console.warn(`No JSON-LD found for ${market.subdomain} / ${query}`)
-    return []
+  if (!response.ok) {
+    throw new Error(`Apify actor failed: ${response.status} ${await response.text()}`)
   }
 
-  let jsonData: any
-  try {
-    jsonData = JSON.parse(jsonLdText)
-  } catch (e) {
-    console.error(`Failed to parse JSON-LD for ${market.subdomain}:`, e)
-    return []
+  return response.json()
+}
+
+function mapItem(item: ApifyCLItem, market: typeof FL_MARKETS[0]): Listing | null {
+  const title = item.title || ''
+  const priceRaw = item.price
+  const price = typeof priceRaw === 'number'
+    ? priceRaw
+    : parseFloat(String(priceRaw || '').replace(/[^0-9.]/g, ''))
+
+  if (!price || price < MIN_PRICE) return null
+  if (!isRelevantListing(title)) return null
+
+  const url = item.url || ''
+  if (!url) return null
+
+  const externalId = extractCraigslistId(url) || item.id || url
+
+  return {
+    platform: 'craigslist',
+    external_id: externalId,
+    title,
+    asking_price: price,
+    make: extractMake(title),
+    model: extractModel(title),
+    hours: extractHours(title),
+    location_city: market.city,
+    location_state: market.state,
+    distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
+    url,
+    image_urls: item.images || (item.imageUrl ? [item.imageUrl] : []),
+    posted_at: item.date || '',
+    scraped_at: new Date().toISOString(),
   }
-
-  const items: any[] = jsonData?.itemListElement || []
-  const listings: Listing[] = []
-
-  for (let i = 0; i < items.length; i++) {
-    try {
-      const listing = items[i]?.item
-      if (!listing) continue
-
-      const title: string = listing.name || ''
-      const price = parseFloat(listing.offers?.price || '0')
-      const images: string[] = Array.isArray(listing.image) ? listing.image : (listing.image ? [listing.image] : [])
-
-      // Match URL by index — JSON-LD items and HTML anchors appear in the same order
-      const itemUrl = urlsFromHtml[i] || ''
-
-      if (!price || price < MIN_PRICE) continue
-      if (!isRelevantListing(title)) continue
-      if (!itemUrl) continue
-
-      const externalId = extractCraigslistId(itemUrl)
-      if (!externalId) continue
-
-      listings.push({
-        platform: 'craigslist',
-        external_id: externalId,
-        title,
-        asking_price: price,
-        make: extractMake(title),
-        model: extractModel(title),
-        hours: extractHours(title),
-        location_city: market.city,
-        location_state: market.state,
-        distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
-        url: itemUrl,
-        image_urls: images,
-        posted_at: '',
-        scraped_at: new Date().toISOString(),
-      })
-    } catch (e) { /* skip malformed items */ }
-  }
-
-  return listings
 }
 
 function extractCraigslistId(href: string): string | undefined {
@@ -148,17 +140,6 @@ function isRelevantListing(title: string): boolean {
 }
 
 const BRANDS = ['Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity']
-
-function extractMake(title: string): string | undefined {
-  const upper = title.toUpperCase()
-  return BRANDS.find(b => upper.includes(b.toUpperCase()))
-}
-
-function extractModel(title: string): string | undefined {
-  return title.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+)\b/i)?.[0]
-}
-
-function extractHours(text: string): number | undefined {
-  const match = text.match(/(\d+)\s*(?:hours?|hrs?)/i)
-  return match ? parseInt(match[1]) : undefined
-}
+function extractMake(title: string): string | undefined { return BRANDS.find(b => title.toUpperCase().includes(b.toUpperCase())) }
+function extractModel(title: string): string | undefined { return title.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+)\b/i)?.[0] }
+function extractHours(text: string): number | undefined { const m = text.match(/(\d+)\s*(?:hours?|hrs?)/i); return m ? parseInt(m[1]) : undefined }
