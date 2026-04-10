@@ -14,23 +14,26 @@ export async function GET() {
   const html = await response.text()
   const $ = cheerio.load(html)
 
-  // Try various selectors to find what Craigslist is using now
-  const results = {
-    status: response.status,
-    url,
-    selectors: {
-      'li.cl-search-result': $('li.cl-search-result').length,
-      'li.result-row': $('li.result-row').length,
-      '.cl-search-result': $('.cl-search-result').length,
-      '[data-pid]': $('[data-pid]').length,
-      '.posting-title': $('.posting-title').length,
-      'a.posting-title': $('a.posting-title').length,
-      '.result-title': $('.result-title').length,
-      'li': $('li').length,
-    },
-    // Grab first 2000 chars of body to see structure
-    bodySnippet: html.substring(0, 2000),
+  const jsonLdText = $('#ld_searchpage_results').text()
+  let parsedItems: any[] = []
+  let parseError = null
+  let firstItem = null
+
+  try {
+    const jsonData = JSON.parse(jsonLdText)
+    parsedItems = jsonData?.itemListElement || []
+    firstItem = parsedItems[0] || null
+  } catch (e: any) {
+    parseError = e.message
   }
 
-  return NextResponse.json(results, { headers: { 'Content-Type': 'application/json' } })
+  return NextResponse.json({
+    status: response.status,
+    url,
+    jsonLdFound: !!jsonLdText,
+    jsonLdLength: jsonLdText?.length || 0,
+    itemCount: parsedItems.length,
+    parseError,
+    firstItem, // full structure of the first listing so we can see field names
+  })
 }
