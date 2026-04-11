@@ -1,8 +1,7 @@
 /**
  * eBay Finding API client
  * Fetches SOLD listings as market value comps
- * Now title-driven: builds search query from listing title words
- * so it works for any category (mowers, golf carts, trailers, tools, etc.)
+ * Title-driven query building optimized for lawn equipment
  */
 
 import { EbayComp, EbayToken } from '@/types'
@@ -37,33 +36,59 @@ export async function getEbayToken(): Promise<string> {
 }
 
 /**
- * Build an eBay search query from a listing title.
- * Extracts the most meaningful 4-5 words so we get relevant comps
- * regardless of category (mowers, golf carts, trailers, tools, etc.)
+ * Build an eBay search query from a Craigslist listing title.
+ *
+ * Strategy (in priority order):
+ * 1. make + model  → most precise (e.g. "Toro TimeCutter 5000")
+ * 2. make + key title words → decent fallback
+ * 3. Title keywords only → generic fallback
+ *
+ * The query is intentionally short (3-5 words) so eBay returns
+ * enough results. Too specific = 0 comps.
  */
 export function buildEbayQuery(title: string, make?: string, model?: string): string {
+  // Best case: we know brand + model
   if (make && model) return `${make} ${model}`
-  if (make) return `${make} ${title.split(' ').slice(0, 3).join(' ')}`
 
-  // Strip common filler words and take the first 5 meaningful words
-  const stopWords = new Set(['for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used', 'great', 'condition', 'like', 'works', 'good'])
-  const words = title
+  // Known brand but no model — use brand + first few meaningful title words
+  if (make) {
+    const words = extractMeaningfulWords(title).slice(0, 3)
+    return `${make} ${words.join(' ')}`.trim()
+  }
+
+  // No brand detected — use up to 4 meaningful words from title
+  // For mowers/lawn equipment this usually captures "zero turn", "riding mower", etc.
+  const words = extractMeaningfulWords(title).slice(0, 4)
+  return words.join(' ') || title.split(' ').slice(0, 3).join(' ')
+}
+
+/** Strip noise words and return meaningful tokens from a listing title */
+function extractMeaningfulWords(title: string): string[] {
+  const stopWords = new Set([
+    'for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer',
+    'new', 'used', 'great', 'condition', 'like', 'works', 'good',
+    'the', 'and', 'with', 'very', 'must', 'see', 'price', 'firm',
+    'nice', 'clean', 'runs', 'excellent', 'perfect',
+  ])
+  return title
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2 && !stopWords.has(w))
-    .slice(0, 5)
-
-  return words.join(' ')
 }
 
 /**
- * Fetch sold eBay listings for market value comps
- * Uses Finding API (findCompletedItems) — no special approval required
+ * Fetch sold eBay listings for market value comps.
+ * Uses Finding API (findCompletedItems) — no special approval required.
  */
-export async function fetchSoldComps(make: string | undefined, model: string | undefined, limit = 20, title?: string): Promise<EbayComp[]> {
-  const query = buildEbayQuery(title || make || 'used equipment', make, model)
-  console.log(`eBay query: "${query}" for listing: "${title?.substring(0, 50)}"`)
+export async function fetchSoldComps(
+  make: string | undefined,
+  model: string | undefined,
+  limit = 20,
+  title?: string
+): Promise<EbayComp[]> {
+  const query = buildEbayQuery(title || make || 'zero turn mower', make, model)
+  console.log(`eBay query: "${query}" for: "${title?.substring(0, 50)}"`)
 
   const params = new URLSearchParams({
     'OPERATION-NAME': 'findCompletedItems',
@@ -74,8 +99,8 @@ export async function fetchSoldComps(make: string | undefined, model: string | u
     'keywords': query,
     'itemFilter(0).name': 'SoldItemsOnly',
     'itemFilter(0).value': 'true',
-    'itemFilter(1).name': 'MinPrice',
-    'itemFilter(1).value': '100',
+    // Removed MinPrice filter — it was too restrictive and causing 0 comps
+    // eBay will still return real sold prices; we filter outliers in calculateMarketValue
     'paginationInput.entriesPerPage': String(limit),
     'sortOrder': 'EndTimeSoonest',
   })
@@ -85,12 +110,13 @@ export async function fetchSoldComps(make: string | undefined, model: string | u
 
   const data = await response.json()
 
-  // Handle rate limit error shape
+  // Handle rate limit error shape (error is top-level, not inside response wrapper)
   if (data?.errorMessage) {
     throw new Error(`eBay API error: ${JSON.stringify(data.errorMessage)}`)
   }
 
   const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+  console.log(`eBay returned ${items.length} completed items for "${query}"`)
 
   return items
     .filter((item: any) => item?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales')
@@ -128,7 +154,11 @@ export function calculateMarketValue(comps: EbayComp[]): {
   }
 }
 
-const TARGET_BRANDS = ['Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity', 'Club Car', 'EZGO', 'Yamaha', 'Big Tex', 'Load Trail']
+const TARGET_BRANDS = [
+  'Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag',
+  'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity',
+  'Club Car', 'EZGO', 'Yamaha', 'Big Tex', 'Load Trail',
+]
 
 function extractMake(title: string): string | undefined {
   return TARGET_BRANDS.find(b => title.toUpperCase().includes(b.toUpperCase()))

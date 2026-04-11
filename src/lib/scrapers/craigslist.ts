@@ -1,8 +1,12 @@
 /**
  * Craigslist scraper via Apify actor (automation-lab~craigslist-scraper)
- * Price-driven approach: no keyword filter, just min_price.
- * All scoring and relevance filtering is handled downstream by eBay comps.
- * 1 call per market = 8 Apify calls per cron run.
+ *
+ * KEYWORD-DRIVEN approach: one Apify call per keyword per market.
+ * This ensures we only fetch relevant listings (mowers, golf carts, etc.)
+ * instead of all $500+ items. Far cheaper on Apify quota.
+ *
+ * Apify calls per cron run: 8 markets × N keywords
+ * At 3 keywords: 24 calls/run (well within free tier at 2 runs/day)
  */
 
 import { Listing } from '@/types'
@@ -13,6 +17,14 @@ const HOME_LNG = -81.0559
 const APIFY_BASE = 'https://api.apify.com/v2'
 const CL_ACTOR_ID = 'automation-lab~craigslist-scraper'
 const MIN_PRICE = 500
+
+// Keywords to search for. Keep this list focused — each adds 8 Apify calls per run.
+// Phase 2: add 'golf cart', 'utility trailer', 'pressure washer'
+const SEARCH_KEYWORDS = [
+  'zero turn mower',
+  'riding mower',
+  'lawn tractor',
+]
 
 const FL_MARKETS = [
   { subdomain: 'daytona',      city: 'Daytona Beach',  state: 'FL', lat: 29.2108, lng: -81.0228 },
@@ -43,29 +55,38 @@ export async function scrapeCraigslist(): Promise<Listing[]> {
   }
 
   const allListings: Listing[] = []
-  const seen = new Set<string>()
+  const seen = new Set<string>() // dedup by listing URL
 
   for (const market of FL_MARKETS) {
-    try {
-      const items = await runApifyActor(token, market.subdomain)
-      for (const item of items) {
-        const listing = mapItem(item, market)
-        if (!listing) continue
-        if (seen.has(listing.url)) continue
-        seen.add(listing.url)
-        allListings.push(listing)
+    for (const keyword of SEARCH_KEYWORDS) {
+      try {
+        const items = await runApifyActor(token, market.subdomain, keyword)
+        for (const item of items) {
+          const listing = mapItem(item, market)
+          if (!listing) continue
+          // Dedup across keyword searches in same market
+          if (seen.has(listing.external_id)) continue
+          seen.add(listing.external_id)
+          allListings.push(listing)
+        }
+        console.log(`${market.subdomain} [${keyword}]: ${items.length} raw items`)
+      } catch (e) {
+        console.error(`CL Apify ${market.subdomain} [${keyword}] error:`, e)
       }
-      console.log(`${market.subdomain}: ${items.length} raw, ${allListings.length} total so far`)
-    } catch (e) {
-      console.error(`CL Apify ${market.subdomain} error:`, e)
+      // Be polite to Apify between calls
+      await new Promise(r => setTimeout(r, 500))
     }
-    await new Promise(r => setTimeout(r, 500))
   }
 
+  console.log(`Craigslist total unique: ${allListings.length}`)
   return allListings
 }
 
-async function runApifyActor(token: string, subdomain: string): Promise<ApifyCLItem[]> {
+async function runApifyActor(
+  token: string,
+  subdomain: string,
+  keyword: string
+): Promise<ApifyCLItem[]> {
   const response = await fetch(
     `${APIFY_BASE}/acts/${CL_ACTOR_ID}/run-sync-get-dataset-items?token=${token}&timeout=60&memory=256`,
     {
@@ -74,10 +95,9 @@ async function runApifyActor(token: string, subdomain: string): Promise<ApifyCLI
       body: JSON.stringify({
         city: subdomain,
         category: 'for_sale',
-        // No searchQuery — returns all for-sale listings above min price
-        // eBay comp scoring filters out low-value items naturally
+        searchQuery: keyword,
         minPrice: MIN_PRICE,
-        maxResults: 100,
+        maxResults: 50, // 50 per keyword is plenty; reduces quota burn
         includeDetails: false,
       }),
     }
@@ -96,10 +116,23 @@ function mapItem(item: ApifyCLItem, market: typeof FL_MARKETS[0]): Listing | nul
 
   if (!price || price < MIN_PRICE) return null
 
-  const url = item.url || ''
-  if (!url) return null
+  // Build canonical CL URL from the numeric listing ID.
+  // Apify sometimes returns a redirect/tracking URL — reconstruct
+  // the real URL so "View Listing" goes to the right place.
+  const rawUrl = item.url || ''
+  const listingId = extractCraigslistId(rawUrl) || item.listingId || ''
 
-  const externalId = extractCraigslistId(url) || item.listingId || url
+  // Canonical URL: https://{subdomain}.craigslist.org/search/sss#{id}
+  // But the direct item URL is more reliable:
+  // https://{subdomain}.craigslist.org/for_sale/{id}.html
+  // We reconstruct it if we have the numeric ID.
+  const canonicalUrl = listingId && /^\d{10}$/.test(listingId)
+    ? `https://${market.subdomain}.craigslist.org/d/item/${listingId}.html`
+    : rawUrl // Fall back to whatever Apify gave us
+
+  if (!canonicalUrl) return null
+
+  const externalId = listingId || rawUrl
 
   return {
     platform: 'craigslist',
@@ -112,15 +145,18 @@ function mapItem(item: ApifyCLItem, market: typeof FL_MARKETS[0]): Listing | nul
     location_city: market.city,
     location_state: market.state,
     distance_miles: getDistanceMiles(HOME_LAT, HOME_LNG, market.lat, market.lng),
-    url,
+    url: canonicalUrl,
     image_urls: item.imageUrls || [],
     posted_at: item.postedAt || '',
     scraped_at: new Date().toISOString(),
   }
 }
 
+/** Extracts the 10-digit numeric listing ID from a Craigslist URL */
 function extractCraigslistId(href: string): string | undefined {
   return href.match(/\/(\d{10})\.html/)?.[1]
+    || href.match(/#(\d{10})$/)?.[1]
+    || href.match(/\/ctl\/(\d+)/)?.[1]
 }
 
 const BRANDS = ['Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity']
