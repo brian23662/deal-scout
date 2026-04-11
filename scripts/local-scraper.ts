@@ -2,8 +2,17 @@
 /**
  * Deal Scout — Local Scraper
  * Runs on your Mac mini at home where Craigslist doesn't block requests.
- * Scrapes all for-sale listings $500+, scores against eBay sold comps,
+ * Scrapes targeted categories at $500+, scores against eBay sold comps,
  * writes results directly to Supabase.
+ *
+ * Categories:
+ *   grq — Farm & Garden (mowers, tractors, generators)
+ *   app — Appliances
+ *   tls — Tools
+ *   bfs — Business/Commercial (pressure washers, restaurant equipment)
+ *   spo — Sporting Goods
+ *
+ * 8 markets × 5 categories = 40 Craigslist requests per run
  *
  * Setup:
  *   1. Run manually:  npx ts-node --project tsconfig.scripts.json scripts/local-scraper.ts
@@ -36,6 +45,14 @@ const FL_MARKETS = [
   { subdomain: 'gainesville',  city: 'Gainesville',    state: 'FL', lat: 29.6516, lng: -82.3248 },
   { subdomain: 'ocala',        city: 'Ocala',          state: 'FL', lat: 29.1872, lng: -82.1401 },
   { subdomain: 'treasure',     city: 'Treasure Coast', state: 'FL', lat: 27.2711, lng: -80.3582 },
+]
+
+const CL_CATEGORIES = [
+  { code: 'grq', label: 'Farm & Garden' },
+  { code: 'app', label: 'Appliances' },
+  { code: 'tls', label: 'Tools' },
+  { code: 'bfs', label: 'Business/Commercial' },
+  { code: 'spo', label: 'Sporting Goods' },
 ]
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
@@ -71,9 +88,13 @@ interface EbayComp {
 
 // ─── Craigslist Scraper ───────────────────────────────────────────────────────
 
-async function scrapeMarket(market: typeof FL_MARKETS[0]): Promise<Listing[]> {
+async function scrapeMarket(
+  market: typeof FL_MARKETS[0],
+  categoryCode: string,
+  categoryLabel: string
+): Promise<Listing[]> {
   const params = new URLSearchParams({ min_price: String(MIN_PRICE), sort: 'date' })
-  const url = `https://${market.subdomain}.craigslist.org/search/sss?${params}`
+  const url = `https://${market.subdomain}.craigslist.org/search/${categoryCode}?${params}`
 
   const response = await fetch(url, {
     headers: {
@@ -91,7 +112,7 @@ async function scrapeMarket(market: typeof FL_MARKETS[0]): Promise<Listing[]> {
   // Parse JSON-LD results
   const jsonLdText = $('#ld_searchpage_results').text()
   if (!jsonLdText) {
-    console.warn(`  No JSON-LD for ${market.subdomain}`)
+    console.warn(`  No JSON-LD for ${market.subdomain}/${categoryLabel}`)
     return []
   }
 
@@ -152,17 +173,19 @@ async function scrapeAllMarkets(): Promise<Listing[]> {
   const seen = new Set<string>()
 
   for (const market of FL_MARKETS) {
-    try {
-      console.log(`  Scraping ${market.subdomain}...`)
-      const listings = await scrapeMarket(market)
-      for (const l of listings) {
-        if (!seen.has(l.url)) { seen.add(l.url); all.push(l) }
+    for (const category of CL_CATEGORIES) {
+      try {
+        console.log(`  Scraping ${market.subdomain}/${category.label}...`)
+        const listings = await scrapeMarket(market, category.code, category.label)
+        for (const l of listings) {
+          if (!seen.has(l.external_id)) { seen.add(l.external_id); all.push(l) }
+        }
+        console.log(`  ${market.subdomain}/${category.label}: ${listings.length} listings`)
+      } catch (e: any) {
+        console.error(`  ${market.subdomain}/${category.label} error:`, e.message)
       }
-      console.log(`  ${market.subdomain}: ${listings.length} listings`)
-    } catch (e: any) {
-      console.error(`  ${market.subdomain} error:`, e.message)
+      await sleep(1500)
     }
-    await sleep(1500)
   }
 
   return all
@@ -186,7 +209,7 @@ async function getEbayToken(): Promise<string> {
   })
 
   if (!res.ok) throw new Error(`eBay auth failed: ${await res.text()}`)
-  const data = await res.json() as any  // cast to any — eBay token response
+  const data = await res.json() as any
   ebayToken = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 }
   return ebayToken.token
 }
@@ -217,8 +240,13 @@ async function fetchSoldComps(title: string, make?: string, model?: string): Pro
   const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
   if (!res.ok) return []
 
-  const data = await res.json() as any  // cast to any — eBay Finding API response
-  if (data?.errorMessage) return []
+  const data = await res.json() as any
+
+  // Rate limit hit — stop immediately so we don't waste the rest of the run
+  if (data?.errorMessage) {
+    const msg = JSON.stringify(data.errorMessage)
+    throw new Error(`eBay rate limit or API error: ${msg}`)
+  }
 
   const items: any[] = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
   return items
@@ -270,6 +298,7 @@ function scoreDeal(listing: Listing, comps: EbayComp[]) {
 async function main() {
   console.log('🔍 Deal Scout local scraper starting...')
   console.log(`   Min price: $${MIN_PRICE} | Min profit: $${MIN_PROFIT_DOLLARS} / ${MIN_PROFIT_PERCENT}%`)
+  console.log(`   Categories: ${CL_CATEGORIES.map(c => c.label).join(', ')}`)
 
   const results = { scraped: 0, scored: 0, qualified: 0, skipped: 0, errors: 0 }
 
@@ -321,6 +350,14 @@ async function main() {
 
       await sleep(300)
     } catch (e: any) {
+      // If eBay rate limits us, stop scoring immediately rather than
+      // grinding through thousands of listings with empty comps
+      if (e.message.includes('eBay rate limit')) {
+        console.error(`\n⛔ ${e.message}`)
+        console.error(`   Stopping early. Results so far:`, results)
+        console.error(`   Wait a few hours for the quota to reset, then re-run.`)
+        process.exit(1)
+      }
       console.error(`  Error scoring ${listing.external_id}:`, e.message)
       results.errors++
     }
@@ -341,7 +378,11 @@ function getDistanceMiles(lat1: number, lng1: number, lat2: number, lng2: number
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)))
 }
 
-const BRANDS = ['Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag', 'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity', 'Club Car', 'EZGO', 'Yamaha']
+const BRANDS = [
+  'Toro', 'Bad Boy', 'Husqvarna', 'John Deere', 'Kubota', 'Scag',
+  'Exmark', 'Gravely', 'Ferris', 'Ariens', 'Cub Cadet', 'Simplicity',
+  'Club Car', 'EZGO', 'Yamaha', 'Honda', 'Generac', 'DeWalt', 'Milwaukee',
+]
 function extractMake(t: string) { return BRANDS.find(b => t.toUpperCase().includes(b.toUpperCase())) }
 function extractModel(t: string) { return t.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+)\b/i)?.[0] }
 function extractHours(t: string) { const m = t.match(/(\d+)\s*(?:hours?|hrs?)/i); return m ? parseInt(m[1]) : undefined }
