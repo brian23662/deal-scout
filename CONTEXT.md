@@ -20,13 +20,19 @@ and related equipment, scores each listing against real eBay sold data to estima
 potential, and sends SMS + email alerts when a deal meets our thresholds. A Next.js
 dashboard tracks deal status from discovery through purchase.
 
-**Core loop (runs every 30 min via Vercel Cron):**
+**Core loop — two-phase architecture:**
+
+**Phase 1 — Scrape (every 30 min via cron-job.org → /api/cron):**
 1. Scrape Craigslist (8 FL markets) and Facebook Marketplace (via Apify) for listings
-2. Fetch eBay sold comps for each listing's make/model via the eBay Finding API
-3. Score each listing — flag if profit potential >= 20% margin AND >= $600 absolute profit
-4. Save all scored deals to Supabase
-5. Send SMS (Twilio) + email (Resend) alerts for qualifying deals
-6. Dashboard at /dashboard shows all deals with filter/sort and status workflow
+2. Save new listings to Supabase with zeroed scores (comp_count=0)
+3. No eBay calls — fast and rate-limit-proof
+
+**Phase 2 — Score (every 4 hours via cron-job.org → /api/score):**
+1. Fetch up to 10 unscored listings (comp_count=0) from Supabase
+2. Call eBay Finding API for each with 2-second delay between calls
+3. Update scores in Supabase
+4. Send alerts for qualifying deals
+5. If eBay rate limits, stop gracefully — next run picks up where it left off
 
 ---
 
@@ -50,13 +56,17 @@ All thresholds live in `.env.local` — no code changes needed to adjust them.
 
 - **Framework:** Next.js 14 (App Router)
 - **Database:** Supabase (3 tables: scored_deals, ebay_comps, alert_log)
-- **Deployment:** Vercel (Hobby plan — cron requires Pro or external trigger)
+- **Deployment:** Vercel Hobby plan at https://deal-scout-2.vercel.app
 - **Scraping:** Cheerio for Craigslist, Apify actor for Facebook Marketplace
 - **Pricing data:** eBay Finding API (findCompletedItems — sold listings only)
 - **Alerts:** Twilio SMS + Resend email
 - **Language:** TypeScript throughout
+- **Cron:** cron-job.org (two jobs — scrape every 30min, score every 4hrs)
 
 **GitHub repo:** https://github.com/brian23662/deal-scout
+
+**Important local path:** The repo is at `~/Projects/deal-scout/deal-scout` (double-nested).
+Always `cd ~/Projects/deal-scout/deal-scout` before running any git or npm commands.
 
 ---
 
@@ -66,7 +76,9 @@ All thresholds live in `.env.local` — no code changes needed to adjust them.
 deal-scout/
 ├── .env.example                        ← All required env vars documented here
 ├── scripts/
-│   └── test-ebay.ts                    ← Run this to verify eBay API works
+│   ├── test-ebay.ts                    ← Run this to verify eBay API works
+│   ├── local-scraper.ts                ← Standalone local scraper (for testing)
+│   └── com.dealscout.scraper.plist     ← macOS launchd config (unused)
 ├── supabase/migrations/
 │   └── 001_initial_schema.sql          ← Run in Supabase SQL Editor to create tables
 └── src/
@@ -74,7 +86,8 @@ deal-scout/
     ├── app/
     │   ├── dashboard/page.tsx          ← Server component, fetches deals from Supabase
     │   └── api/
-    │       ├── cron/route.ts           ← Main orchestrator (POST, secured by CRON_SECRET)
+    │       ├── cron/route.ts           ← Phase 1: scrape only, no eBay calls
+    │       ├── score/route.ts          ← Phase 2: score unscored listings against eBay
     │       ├── ebay/route.ts           ← GET /api/ebay?make=Toro&model=Titan — returns comps
     │       └── listings/[id]/route.ts  ← PATCH — update deal status/notes/actual prices
     ├── components/
@@ -83,7 +96,7 @@ deal-scout/
         ├── ebay/client.ts              ← eBay OAuth + fetchSoldComps + calculateMarketValue
         ├── scoring/index.ts            ← scoreDeal(), formatDealAlert(), formatDealAlertHTML()
         ├── scrapers/
-        │   ├── craigslist.ts           ← Scrapes 8 FL Craigslist markets
+        │   ├── craigslist.ts           ← Scrapes 8 FL Craigslist markets (5 categories each)
         │   └── facebook.ts             ← Apify-based Facebook Marketplace scraper
         ├── alerts.ts                   ← sendSMSAlert(), sendEmailAlert(), sendDealAlerts()
         ├── geo.ts                      ← Haversine distance calculation
@@ -100,6 +113,7 @@ deal-scout/
 - Workflow: status (new/contacted/passed/purchased), alert_sent, notes
 - Results: actual_buy_price, actual_sell_price, actual_profit
 - Unique constraint: (platform, external_id) — prevents duplicates
+- **comp_count=0 means unscored** — used by /api/score to find work to do
 
 **ebay_comps** — sold eBay listings used for pricing (cache layer)
 
@@ -130,15 +144,31 @@ A deal **qualifies** (triggers an alert) when ALL three are true:
 - Cert ID (Client Secret): in `.env.local` as `EBAY_CLIENT_SECRET`
 - Environment: `production`
 
-**Finding API (findCompletedItems):** ✅ auth works, hit rate limit during initial testing
-(new accounts have low call quotas that reset within hours — will be fine in production)
+**Finding API (findCompletedItems):** ✅ auth works. Rate limited (error 10001) during
+testing — quota resets overnight. In production the two-phase approach makes only ~60
+calls/day (10 listings × 6 score runs) which is well within limits.
 
 **Marketplace Insights API:** ❌ requires "application growth check" approval from eBay —
 not worth pursuing. The Finding API fallback handles everything we need.
 
 **Exemption filed:** Selected "I do not persist eBay data" — approved, keyset is active.
 
+**IMPORTANT:** Do NOT keep running the test script while rate limited — each run burns quota.
 Test script: `npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts`
+
+---
+
+### cron-job.org Setup (two jobs)
+
+| Job | URL | Schedule | Status |
+|-----|-----|----------|--------|
+| Deal Scout (scrape) | https://deal-scout-2.vercel.app/api/cron | Every 30 min | **Disabled — re-enable when eBay quota resets** |
+| Deal Scout - Score | https://deal-scout-2.vercel.app/api/score | Every 4 hours | Enabled |
+
+Both jobs use `x-cron-secret` header (not HTTP Basic Auth) with POST method.
+
+**Next step:** When eBay quota resets (check with test script), re-enable the scrape job.
+Listings will appear on dashboard immediately; scores will populate within 4 hours.
 
 ---
 
@@ -155,8 +185,9 @@ Test script: `npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts`
 | ocala | Ocala | ~75 mi |
 | treasure | Treasure Coast | ~110 mi |
 
-Scraper targets the `grd` (farm+garden) category with min_price=$500, sorted newest first.
-Uses cheerio to parse `li.cl-search-result` elements.
+Scraper covers 5 categories per market: Farm & Garden, Appliances, Tools, Business/Commercial,
+Sporting Goods. 8 markets × 5 categories = 40 requests per cron run.
+Uses cheerio to parse JSON-LD embedded in Craigslist search pages.
 
 ---
 
@@ -170,26 +201,9 @@ to our `Listing` type. If Apify isn't configured, Craigslist runs alone.
 
 ---
 
-### Vercel Cron
+### Dashboard
 
-`vercel.json` schedules `/api/cron` every 30 minutes:
-```json
-{ "crons": [{ "path": "/api/cron", "schedule": "*/30 * * * *" }] }
-```
-
-**Important:** Vercel Cron requires the **Pro plan** ($20/mo). On the free Hobby plan,
-use an external service like https://cron-job.org to POST to your `/api/cron` endpoint
-with the `x-cron-secret` header.
-
-Manual test:
-```bash
-curl -X POST https://your-vercel-url.vercel.app/api/cron \
-  -H "x-cron-secret: your_cron_secret_here"
-```
-
----
-
-### Dashboard Features
+Live at: https://deal-scout-2.vercel.app/dashboard
 
 - **Stats bar:** Total scraped / Qualified deals / New today / Purchased
 - **Filter bar:** By status (new/contacted/passed/purchased), platform, qualified-only toggle
@@ -219,16 +233,14 @@ Code changes needed for expansion:
 
 ### What Still Needs To Be Done
 
-#### Immediate (before first run)
-- [x] Get eBay Developer API credentials — done, keys in `.env.local`
-- [x] Run `scripts/test-ebay.ts` — auth confirmed working
-- [ ] Create Supabase project, run `supabase/migrations/001_initial_schema.sql`
-- [ ] Add Supabase keys to `.env.local`
-- [ ] Set up Twilio account, get phone number
-- [ ] Set up Resend account, verify domain, update `from` address in `src/lib/alerts.ts`
-- [ ] Deploy to Vercel: `vercel` CLI or connect GitHub repo
-- [ ] Add all env vars to Vercel environment settings
-- [ ] Set up cron trigger (Vercel Pro or cron-job.org)
+#### Immediate (next session)
+- [ ] Verify eBay quota has reset: `npx ts-node --project tsconfig.scripts.json scripts/test-ebay.ts`
+- [ ] Re-enable the scrape job on cron-job.org
+- [ ] Confirm listings appear on dashboard and scores populate within 4 hours
+
+#### Not Yet Configured (non-blocking)
+- [ ] Twilio SMS alerts — fails gracefully when not configured
+- [ ] Resend email alerts — fails gracefully when not configured
 
 #### Nice to Have / Next Features
 - [ ] OfferUp scraper (currently in platform list but scraper not yet built)
@@ -244,6 +256,10 @@ Code changes needed for expansion:
 
 ### Key Design Decisions (don't change without reason)
 
+- **Two-phase architecture** — scrape and score are separate endpoints/jobs to avoid eBay rate limits
+- **comp_count=0 = unscored** — /api/score uses this to find listings needing eBay lookups
+- **Batch size 10, 2s delay** — /api/score processes 10 listings per run with 2s between eBay calls
+- **Graceful rate limit handling** — if eBay returns error 10001, /api/score stops and resumes next run
 - **Median, not average** for market value — more robust against outlier sale prices
 - **Both thresholds required** (% AND $) — prevents alerting on cheap items with high % margins
 - **Dedup by (platform, external_id)** — same listing won't be scored twice across cron runs
@@ -251,6 +267,15 @@ Code changes needed for expansion:
 - **Service role key for cron, anon key for client** — never expose service role to browser
 - **Score saved to DB** — lets you analyze score distribution over time and tune thresholds
 - **Finding API only** — Marketplace Insights requires special eBay approval, not worth it
+
+---
+
+### Key Learnings & Gotchas
+
+- **Double-nested repo:** Local path is `~/Projects/deal-scout/deal-scout` — always cd into the inner folder
+- **eBay rate limit error shape:** surfaces as top-level `errorMessage` key, not inside `findCompletedItemsResponse` wrapper
+- **cron-job.org auth:** must use custom `x-cron-secret` header, NOT HTTP Basic Auth
+- **Vercel URL:** https://deal-scout-2.vercel.app (not deal-scout.vercel.app)
 
 ---
 
