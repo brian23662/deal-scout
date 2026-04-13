@@ -1,17 +1,18 @@
 /**
- * POST /api/cron - Main orchestration
- * Triggered every 4 hours via cron-job.org (free alternative to Vercel Cron)
+ * POST /api/cron - Scrape only, no eBay calls
+ * Triggered every 30 min via cron-job.org
  * Secured with x-cron-secret header
  *
- * Price-driven approach: scrapes all for-sale listings above $500,
- * scores each against eBay sold comps. No category filtering needed —
- * low-comp items naturally score low and don't trigger alerts.
+ * Phase 1 of 2-phase approach:
+ * 1. Scrape Craigslist for new listings
+ * 2. Save them to Supabase with comp_count=0 (unscored)
+ * 3. Return immediately — no eBay calls here
+ *
+ * Scoring happens separately via /api/score (runs every 4 hours)
+ * This keeps the cron fast and immune to eBay rate limits.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { fetchSoldComps } from '@/lib/ebay/client'
-import { scoreDeal } from '@/lib/scoring'
-import { sendDealAlerts } from '@/lib/alerts'
 import { supabaseAdmin } from '@/lib/supabase'
 import { scrapeCraigslist } from '@/lib/scrapers/craigslist'
 import { Listing } from '@/types'
@@ -22,17 +23,17 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  console.log('🔍 Deal Scout cron starting...')
-  const results = { scraped: 0, scored: 0, qualified: 0, alerted: 0, errors: [] as string[] }
+  console.log('🔍 Deal Scout cron starting (scrape phase)...')
+  const results = { scraped: 0, saved: 0, skipped: 0, errors: [] as string[] }
 
   try {
     const allListings: Listing[] = []
 
-    // Craigslist via Apify (price-driven, all categories)
+    // Craigslist
     try {
       const clListings = await scrapeCraigslist()
       allListings.push(...clListings)
-      console.log(`Craigslist total: ${clListings.length} listings`)
+      console.log(`Craigslist: ${clListings.length} listings`)
     } catch (e: any) { results.errors.push(`Craigslist: ${e.message}`) }
 
     // Facebook via Apify (when token present)
@@ -46,52 +47,61 @@ export async function POST(req: NextRequest) {
     }
 
     results.scraped = allListings.length
-    console.log(`Total listings to score: ${allListings.length}`)
+    console.log(`Total scraped: ${allListings.length}`)
 
+    // Save new listings — no eBay calls, scores default to 0
     for (const listing of allListings) {
       try {
         // Dedup check
         const { data: existing } = await supabaseAdmin
           .from('scored_deals').select('id')
-          .eq('platform', listing.platform).eq('external_id', listing.external_id).single()
-        if (existing) continue
+          .eq('platform', listing.platform)
+          .eq('external_id', listing.external_id)
+          .single()
 
-        // Score against eBay comps — pass full title for smart query building
-        const comps = await fetchSoldComps(listing.make, listing.model, 20, listing.title)
-        const score = scoreDeal(listing, comps)
-        results.scored++
+        if (existing) { results.skipped++; continue }
 
-        // Save to DB
+        // Save with zeroed scores — /api/score will fill these in
         const { error: insertError } = await supabaseAdmin.from('scored_deals').insert({
-          platform: listing.platform, external_id: listing.external_id, title: listing.title,
-          asking_price: listing.asking_price, make: listing.make, model: listing.model,
-          hours: listing.hours, location_city: listing.location_city,
-          location_state: listing.location_state, distance_miles: listing.distance_miles,
-          url: listing.url, image_urls: listing.image_urls, posted_at: listing.posted_at,
-          estimated_market_value: score.estimated_market_value,
-          profit_potential: score.profit_potential, profit_percent: score.profit_percent,
-          deal_score: score.score, comp_count: score.comp_count,
-          qualifies: score.qualifies, status: 'new', alert_sent: false,
+          platform: listing.platform,
+          external_id: listing.external_id,
+          title: listing.title,
+          asking_price: listing.asking_price,
+          make: listing.make,
+          model: listing.model,
+          hours: listing.hours,
+          location_city: listing.location_city,
+          location_state: listing.location_state,
+          distance_miles: listing.distance_miles,
+          url: listing.url,
+          image_urls: listing.image_urls,
+          posted_at: listing.posted_at,
+          // Scores zeroed out — will be filled by /api/score
+          estimated_market_value: 0,
+          profit_potential: 0,
+          profit_percent: 0,
+          deal_score: 0,
+          comp_count: 0,
+          qualifies: false,
+          status: 'new',
+          alert_sent: false,
         })
 
-        if (insertError) { results.errors.push(`DB: ${insertError.message}`); continue }
-
-        // Alert if qualifies
-        if (score.qualifies) {
-          results.qualified++
-          await sendDealAlerts(listing, score)
-          await supabaseAdmin.from('scored_deals').update({ alert_sent: true })
-            .eq('platform', listing.platform).eq('external_id', listing.external_id)
-          results.alerted++
-          console.log(`🔥 Alert: ${listing.title} - $${score.profit_potential} profit`)
+        if (insertError) {
+          results.errors.push(`DB insert ${listing.external_id}: ${insertError.message}`)
+          continue
         }
 
-        await new Promise(r => setTimeout(r, 300))
-      } catch (e: any) { results.errors.push(`Scoring ${listing.external_id}: ${e.message}`) }
+        results.saved++
+      } catch (e: any) {
+        results.errors.push(`Save ${listing.external_id}: ${e.message}`)
+      }
     }
-  } catch (e: any) { results.errors.push(`Fatal: ${e.message}`) }
+  } catch (e: any) {
+    results.errors.push(`Fatal: ${e.message}`)
+  }
 
-  console.log('✅ Cron complete:', results)
+  console.log('✅ Scrape phase complete:', results)
   return NextResponse.json(results)
 }
 
