@@ -14,6 +14,9 @@
  *
  * 8 markets × 5 categories = 40 Craigslist requests per run
  *
+ * eBay comps: Scrapes ebay.com sold listings directly (no API key needed).
+ * The Finding API (findCompletedItems) was decommissioned Feb 2025.
+ *
  * Setup:
  *   1. Run manually:  npx ts-node --project tsconfig.scripts.json scripts/local-scraper.ts
  *   2. Schedule with launchd (see scripts/com.dealscout.scraper.plist)
@@ -191,70 +194,71 @@ async function scrapeAllMarkets(): Promise<Listing[]> {
   return all
 }
 
-// ─── eBay Comps ───────────────────────────────────────────────────────────────
-
-let ebayToken: { token: string; expiresAt: number } | null = null
-
-async function getEbayToken(): Promise<string> {
-  if (ebayToken && Date.now() < ebayToken.expiresAt - 300000) return ebayToken.token
-
-  const credentials = Buffer.from(
-    `${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`
-  ).toString('base64')
-
-  const res = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
-    method: 'POST',
-    headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
-  })
-
-  if (!res.ok) throw new Error(`eBay auth failed: ${await res.text()}`)
-  const data = await res.json() as any
-  ebayToken = { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 }
-  return ebayToken.token
-}
+// ─── eBay Sold Comps (scraped from ebay.com — no API key needed) ─────────────
+//
+// The Finding API (findCompletedItems) was decommissioned in Feb 2025.
+// Instead, we scrape the public sold listings search page on ebay.com.
+// This returns the same data: item title + sold price.
 
 async function fetchSoldComps(title: string, make?: string, model?: string): Promise<EbayComp[]> {
-  const stopWords = new Set(['for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used', 'great', 'condition', 'like', 'works', 'good'])
+  // Build a search query from the listing title
+  const stopWords = new Set([
+    'for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used',
+    'great', 'condition', 'like', 'works', 'good', 'with', 'and', 'the', 'inch',
+  ])
   const query = make && model
     ? `${make} ${model}`
     : make
     ? `${make} ${title.split(' ').slice(0, 3).join(' ')}`
-    : title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
+    : title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+        .filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
 
   const params = new URLSearchParams({
-    'OPERATION-NAME': 'findCompletedItems',
-    'SERVICE-VERSION': '1.0.0',
-    'SECURITY-APPNAME': process.env.EBAY_CLIENT_ID || '',
-    'RESPONSE-DATA-FORMAT': 'JSON',
-    'REST-PAYLOAD': '',
-    'keywords': query,
-    'itemFilter(0).name': 'SoldItemsOnly',
-    'itemFilter(0).value': 'true',
-    'itemFilter(1).name': 'MinPrice',
-    'itemFilter(1).value': '100',
-    'paginationInput.entriesPerPage': '20',
-    'sortOrder': 'EndTimeSoonest',
+    _nkw: query,
+    LH_Complete: '1',   // Completed listings
+    LH_Sold: '1',       // Sold only
+    _udlo: '100',        // Min price $100 (filter out junk/parts)
+    _ipg: '60',          // Up to 60 results per page
+    rt: 'nc',
+    _sop: '13',          // Sort by end date: newest first
   })
 
-  const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`)
-  if (!res.ok) return []
+  const url = `https://www.ebay.com/sch/i.html?${params}`
 
-  const data = await res.json() as any
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  })
 
-  // Rate limit hit — stop immediately so we don't waste the rest of the run
-  if (data?.errorMessage) {
-    const msg = JSON.stringify(data.errorMessage)
-    throw new Error(`eBay rate limit or API error: ${msg}`)
+  if (!response.ok) {
+    throw new Error(`eBay search failed: HTTP ${response.status} for query "${query}"`)
   }
 
-  const items: any[] = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
-  return items
-    .filter((item: any) => item?.sellingStatus?.[0]?.sellingState?.[0] === 'EndedWithSales')
-    .map((item: any) => ({
-      sold_price: parseFloat(item.sellingStatus?.[0]?.convertedCurrentPrice?.[0]?.['__value__'] || '0'),
-      title: item.title?.[0] || '',
-    }))
+  const html = await response.text()
+  const $ = cheerio.load(html)
+
+  const comps: EbayComp[] = []
+  $('li.s-card').each((_, el) => {
+    const item = $(el)
+    const text = item.text()
+
+    // Skip non-sold items (sponsored ads, etc.)
+    if (!text.includes('Sold')) return
+
+    const compTitle = (item.find('[role="heading"]').first().text() || '')
+      .replace(/Opens in.*/, '').trim()
+    const priceText = item.find('.s-card__price').text().trim()
+    const price = parseFloat(priceText.replace(/[^0-9.]/g, ''))
+
+    if (compTitle && price > 0) {
+      comps.push({ sold_price: price, title: compTitle })
+    }
+  })
+
+  return comps
 }
 
 function calculateMarketValue(comps: EbayComp[]): number {
@@ -299,6 +303,7 @@ async function main() {
   console.log('🔍 Deal Scout local scraper starting...')
   console.log(`   Min price: $${MIN_PRICE} | Min profit: $${MIN_PROFIT_DOLLARS} / ${MIN_PROFIT_PERCENT}%`)
   console.log(`   Categories: ${CL_CATEGORIES.map(c => c.label).join(', ')}`)
+  console.log(`   eBay comps: scraping sold listings (no API key needed)`)
 
   const results = { scraped: 0, scored: 0, qualified: 0, skipped: 0, errors: 0 }
 
@@ -307,7 +312,7 @@ async function main() {
   results.scraped = listings.length
   console.log(`\n✅ Scraped ${listings.length} listings total`)
 
-  console.log('\n📊 Scoring against eBay comps...')
+  console.log('\n📊 Scoring against eBay sold comps...')
   for (const listing of listings) {
     try {
       const { data: existing } = await supabase
@@ -348,16 +353,9 @@ async function main() {
         console.log(`  🔥 DEAL: ${listing.title} — $${score.profit_potential} profit (${score.profit_percent}%)`)
       }
 
-      await sleep(300)
+      // 2-second delay between eBay requests — polite scraping
+      await sleep(2000)
     } catch (e: any) {
-      // If eBay rate limits us, stop scoring immediately rather than
-      // grinding through thousands of listings with empty comps
-      if (e.message.includes('eBay rate limit')) {
-        console.error(`\n⛔ ${e.message}`)
-        console.error(`   Stopping early. Results so far:`, results)
-        console.error(`   Wait a few hours for the quota to reset, then re-run.`)
-        process.exit(1)
-      }
       console.error(`  Error scoring ${listing.external_id}:`, e.message)
       results.errors++
     }
