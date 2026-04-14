@@ -199,25 +199,48 @@ async function scrapeAllMarkets(): Promise<Listing[]> {
 // The Finding API (findCompletedItems) was decommissioned in Feb 2025.
 // Instead, we scrape the public sold listings search page on ebay.com.
 // This returns the same data: item title + sold price.
+//
+// Key improvements over v1:
+// - Min comp price set to 25% of asking price (filters out parts/accessories)
+// - Better query construction to find whole items, not parts
+// - Progress logging every 25 listings
 
-async function fetchSoldComps(title: string, make?: string, model?: string): Promise<EbayComp[]> {
+async function fetchSoldComps(title: string, askingPrice: number, make?: string, model?: string): Promise<EbayComp[]> {
   // Build a search query from the listing title
   const stopWords = new Set([
     'for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used',
     'great', 'condition', 'like', 'works', 'good', 'with', 'and', 'the', 'inch',
+    'excellent', 'perfect', 'price', 'firm', 'pick', 'only', 'must', 'sell',
+    'need', 'gone', 'today', 'call', 'text', 'cash', 'delivery', 'free',
+    'local', 'pickup', 'available', 'brand', 'model', 'series', 'set',
   ])
-  const query = make && model
-    ? `${make} ${model}`
-    : make
-    ? `${make} ${title.split(' ').slice(0, 3).join(' ')}`
-    : title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
-        .filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
+
+  let query: string
+
+  if (make && model) {
+    // Best case: we know the brand and model
+    query = `${make} ${model}`
+  } else if (make) {
+    // We know the brand — grab a few meaningful words from the title
+    const titleWords = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+      .filter(w => w.length > 2 && !stopWords.has(w) && w.toLowerCase() !== make.toLowerCase())
+      .slice(0, 3).join(' ')
+    query = `${make} ${titleWords}`
+  } else {
+    // No brand detected — use the most meaningful words from the title
+    query = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+      .filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
+  }
+
+  // Set min comp price to 25% of asking price — filters out parts/accessories
+  // e.g., if asking $4500, only show sold items $1125+
+  const minCompPrice = Math.max(100, Math.round(askingPrice * 0.25))
 
   const params = new URLSearchParams({
     _nkw: query,
     LH_Complete: '1',   // Completed listings
     LH_Sold: '1',       // Sold only
-    _udlo: '100',        // Min price $100 (filter out junk/parts)
+    _udlo: String(minCompPrice),  // Dynamic min price based on asking
     _ipg: '60',          // Up to 60 results per page
     rt: 'nc',
     _sop: '13',          // Sort by end date: newest first
@@ -305,7 +328,7 @@ async function main() {
   console.log(`   Categories: ${CL_CATEGORIES.map(c => c.label).join(', ')}`)
   console.log(`   eBay comps: scraping sold listings (no API key needed)`)
 
-  const results = { scraped: 0, scored: 0, qualified: 0, skipped: 0, errors: 0 }
+  const results = { scraped: 0, scored: 0, qualified: 0, skipped: 0, errors: 0, noComps: 0 }
 
   console.log('\n📡 Scraping Craigslist markets...')
   const listings = await scrapeAllMarkets()
@@ -313,7 +336,9 @@ async function main() {
   console.log(`\n✅ Scraped ${listings.length} listings total`)
 
   console.log('\n📊 Scoring against eBay sold comps...')
-  for (const listing of listings) {
+  const startTime = Date.now()
+  for (let i = 0; i < listings.length; i++) {
+    const listing = listings[i]
     try {
       const { data: existing } = await supabase
         .from('scored_deals').select('id')
@@ -323,9 +348,11 @@ async function main() {
 
       if (existing) { results.skipped++; continue }
 
-      const comps = await fetchSoldComps(listing.title, listing.make, listing.model)
+      const comps = await fetchSoldComps(listing.title, listing.asking_price, listing.make, listing.model)
       const score = scoreDeal(listing, comps)
       results.scored++
+
+      if (comps.length === 0) results.noComps++
 
       const { error } = await supabase.from('scored_deals').insert({
         platform: listing.platform,
@@ -351,6 +378,14 @@ async function main() {
       if (score.qualifies) {
         results.qualified++
         console.log(`  🔥 DEAL: ${listing.title} — $${score.profit_potential} profit (${score.profit_percent}%)`)
+      }
+
+      // Progress log every 25 listings
+      if (results.scored % 25 === 0) {
+        const elapsed = Math.round((Date.now() - startTime) / 1000)
+        const remaining = listings.length - i - 1 - results.skipped
+        const etaMins = Math.round((remaining * 2) / 60)
+        console.log(`  📊 Progress: ${results.scored} scored | ${results.noComps} no comps | ${comps.length} comps this one | ${results.qualified} qualified | ~${etaMins} min remaining`)
       }
 
       // 2-second delay between eBay requests — polite scraping
