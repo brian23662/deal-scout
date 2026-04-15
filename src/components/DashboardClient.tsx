@@ -57,13 +57,11 @@ const PLATFORM_LABELS: Record<string, string> = {
 export default function DashboardClient({ deals, stats }: { deals: Deal[], stats: Stats }) {
   const [filterStatus, setFilterStatus] = useState<string>('all')
   const [filterPlatform, setFilterPlatform] = useState<string>('all')
-  const [filterQualified, setFilterQualified] = useState<boolean>(false)
   const [selectedDeal, setSelectedDeal] = useState<Deal | null>(null)
 
   const filtered = deals.filter(d => {
     if (filterStatus !== 'all' && d.status !== filterStatus) return false
     if (filterPlatform !== 'all' && d.platform !== filterPlatform) return false
-    if (filterQualified && !d.qualifies) return false
     return true
   })
 
@@ -113,8 +111,6 @@ export default function DashboardClient({ deals, stats }: { deals: Deal[], stats
         {['all', 'craigslist', 'facebook', 'ebay', 'offerup'].map(p => (
           <FilterChip key={p} label={p === 'all' ? 'ALL PLATFORMS' : p.toUpperCase()} active={filterPlatform === p} onClick={() => setFilterPlatform(p)} />
         ))}
-        <div style={{ width: 1, height: 20, background: '#222', margin: '0 4px' }} />
-        <FilterChip label="QUALIFIED ONLY" active={filterQualified} onClick={() => setFilterQualified(!filterQualified)} color="#22c55e" />
         <div style={{ marginLeft: 'auto', fontSize: 11, color: '#444' }}>{filtered.length} results</div>
       </div>
 
@@ -162,9 +158,6 @@ function DealRow({ deal, onStatusChange, onClick }: {
       {/* Info */}
       <div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-          {deal.qualifies && (
-            <span style={{ fontSize: 9, background: '#22c55e20', color: '#22c55e', padding: '2px 6px', borderRadius: 2, letterSpacing: '1px' }}>QUALIFIED</span>
-          )}
           <span style={{ fontSize: 9, background: '#ffffff10', color: '#666', padding: '2px 6px', borderRadius: 2, letterSpacing: '1px' }}>
             {PLATFORM_LABELS[deal.platform] || deal.platform}
           </span>
@@ -188,20 +181,14 @@ function DealRow({ deal, onStatusChange, onClick }: {
           <span style={{ fontSize: 11, color: '#555' }}>asking </span>
           <span style={{ fontSize: 16, color: '#fff', fontWeight: 600 }}>${deal.asking_price?.toLocaleString()}</span>
         </div>
-        {deal.estimated_market_value ? (
-          <>
-            <div style={{ marginBottom: 2 }}>
-              <span style={{ fontSize: 11, color: '#555' }}>market </span>
-              <span style={{ fontSize: 13, color: '#888' }}>${deal.estimated_market_value?.toLocaleString()}</span>
-            </div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: '#22c55e' }}>
-              +${deal.profit_potential?.toLocaleString()}
-              <span style={{ fontSize: 11, color: '#16a34a', fontWeight: 400 }}> ({deal.profit_percent}%)</span>
-            </div>
-          </>
-        ) : (
-          <div style={{ fontSize: 11, color: '#333' }}>no comps</div>
-        )}
+        <div style={{ marginBottom: 2 }}>
+          <span style={{ fontSize: 11, color: '#555' }}>market </span>
+          <span style={{ fontSize: 13, color: '#888' }}>${deal.estimated_market_value?.toLocaleString()}</span>
+        </div>
+        <div style={{ fontSize: 14, fontWeight: 700, color: '#22c55e' }}>
+          +${deal.profit_potential?.toLocaleString()}
+          <span style={{ fontSize: 11, color: '#16a34a', fontWeight: 400 }}> ({deal.profit_percent}%)</span>
+        </div>
       </div>
     </div>
   )
@@ -230,8 +217,8 @@ function DealDetailPanel({ deal, onClose, onStatusChange }: {
       {/* Price breakdown */}
       <div style={{ background: '#111', borderRadius: 4, padding: 16, marginBottom: 16 }}>
         <DetailRow label="Asking Price" value={`$${deal.asking_price?.toLocaleString()}`} large />
-        <DetailRow label="Est. Market Value" value={deal.estimated_market_value ? `$${deal.estimated_market_value?.toLocaleString()}` : '—'} />
-        <DetailRow label="Profit Potential" value={deal.profit_potential ? `+$${deal.profit_potential?.toLocaleString()} (${deal.profit_percent}%)` : '—'} green={!!deal.profit_potential} />
+        <DetailRow label="Est. Market Value" value={`$${deal.estimated_market_value?.toLocaleString()}`} />
+        <DetailRow label="Profit Potential" value={`+$${deal.profit_potential?.toLocaleString()} (${deal.profit_percent}%)`} green />
         <DetailRow label="Deal Score" value={`${deal.deal_score}/100`} />
         <DetailRow label="eBay Comps" value={`${comps.length} sold listings`} />
       </div>
