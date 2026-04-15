@@ -14,12 +14,14 @@
  *
  * 8 markets × 5 categories = 40 Craigslist requests per run
  *
- * eBay comps: Scrapes ebay.com sold listings directly (no API key needed).
+ * eBay comps: Uses the eBay Browse API (OAuth client credentials).
  * The Finding API (findCompletedItems) was decommissioned Feb 2025.
+ * Direct scraping was blocked by eBay's bot challenge (/splashui/challenge).
  *
  * Setup:
  *   1. Run manually:  npx ts-node --project tsconfig.scripts.json scripts/local-scraper.ts
  *   2. Schedule with launchd (see scripts/com.dealscout.scraper.plist)
+ *   3. Requires EBAY_CLIENT_ID and EBAY_CLIENT_SECRET in .env.local
  */
 
 import * as cheerio from 'cheerio'
@@ -194,19 +196,45 @@ async function scrapeAllMarkets(): Promise<Listing[]> {
   return all
 }
 
-// ─── eBay Sold Comps (scraped from ebay.com — no API key needed) ─────────────
+// ─── eBay Browse API ──────────────────────────────────────────────────────────
 //
-// The Finding API (findCompletedItems) was decommissioned in Feb 2025.
-// Instead, we scrape the public sold listings search page on ebay.com.
-// This returns the same data: item title + sold price.
+// Uses OAuth client credentials flow — no user login needed.
+// Token is fetched once at startup and reused for the entire run (~2hr TTL).
+// Direct scraping of ebay.com was blocked by bot challenge (/splashui/challenge).
 //
-// Key improvements over v1:
-// - Min comp price set to 25% of asking price (filters out parts/accessories)
-// - Better query construction to find whole items, not parts
-// - Progress logging every 25 listings
+// Browse API docs: https://developer.ebay.com/api-docs/buy/browse/overview.html
 
-async function fetchSoldComps(title: string, askingPrice: number, make?: string, model?: string): Promise<EbayComp[]> {
-  // Build a search query from the listing title
+async function getEbayToken(): Promise<string> {
+  const credentials = Buffer.from(
+    `${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`
+  ).toString('base64')
+
+  const res = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`eBay auth failed: HTTP ${res.status} — ${text}`)
+  }
+
+  const data = await res.json()
+  return data.access_token
+}
+
+async function fetchSoldComps(
+  title: string,
+  askingPrice: number,
+  token: string,
+  make?: string,
+  model?: string,
+): Promise<EbayComp[]> {
+  // Build a focused search query from the listing title
   const stopWords = new Set([
     'for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used',
     'great', 'condition', 'like', 'works', 'good', 'with', 'and', 'the', 'inch',
@@ -218,73 +246,52 @@ async function fetchSoldComps(title: string, askingPrice: number, make?: string,
   let query: string
 
   if (make && model) {
-    // Best case: we know the brand and model
     query = `${make} ${model}`
   } else if (make) {
-    // We know the brand — grab a few meaningful words from the title
     const titleWords = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
       .filter(w => w.length > 2 && !stopWords.has(w) && w.toLowerCase() !== make.toLowerCase())
       .slice(0, 3).join(' ')
     query = `${make} ${titleWords}`
   } else {
-    // No brand detected — use the most meaningful words from the title
     query = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
       .filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
   }
 
-  // Set min comp price to 25% of asking price — filters out parts/accessories
-  // e.g., if asking $4500, only show sold items $1125+
+  // Min comp price = 25% of asking — filters out parts/accessories
   const minCompPrice = Math.max(100, Math.round(askingPrice * 0.25))
 
   const params = new URLSearchParams({
-    _nkw: query,
-    LH_Complete: '1',   // Completed listings
-    LH_Sold: '1',       // Sold only
-    _udlo: String(minCompPrice),  // Dynamic min price based on asking
-    _ipg: '60',          // Up to 60 results per page
-    rt: 'nc',
-    _sop: '13',          // Sort by end date: newest first
+    q: query,
+    filter: `buyingOptions:{AUCTION|FIXED_PRICE},soldItemsOnly:true,price:[${minCompPrice}..],priceCurrency:USD`,
+    sort: 'endDateSoonest',
+    limit: '50',
   })
 
-  const url = `https://www.ebay.com/sch/i.html?${params}`
+  const res = await fetch(
+    `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`,
+    {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        'Content-Type': 'application/json',
+      },
+    }
+  )
 
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`eBay search failed: HTTP ${response.status} for query "${query}"`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`eBay Browse API error: HTTP ${res.status} — ${text}`)
   }
 
-  const html = await response.text()
-  const $ = cheerio.load(html)
+  const data = await res.json()
+  const items: any[] = data.itemSummaries || []
 
-  const comps: EbayComp[] = []
-  $('li.s-card').each((_, el) => {
-    const item = $(el)
-
-    // No 'Sold' text check needed — LH_Sold=1 already filters to sold-only results.
-    // The old check was silently dropping all results because the word "Sold"
-    // doesn't appear in the card text the way item.text() renders it.
-    const compTitle = (
-      item.find('.s-card__title, [role="heading"], .su-card-container__primary').first().text() || ''
-    ).replace(/Opens in.*/, '').trim()
-
-    // Use [class*=] so it matches even when the class has multiple names
-    // e.g. "su-styled-text positive bold large-1 s-card__price"
-    const priceText = item.find('[class*="s-card__price"]').first().text().trim()
-    const price = parseFloat(priceText.replace(/[^0-9.]/g, ''))
-
-    if (compTitle && price > 0) {
-      comps.push({ sold_price: price, title: compTitle })
-    }
-  })
-
-  return comps
+  return items
+    .map((item: any) => ({
+      sold_price: parseFloat(item.price?.value || '0'),
+      title: item.title || '',
+    }))
+    .filter(c => c.sold_price > 0 && c.title)
 }
 
 function calculateMarketValue(comps: EbayComp[]): number {
@@ -329,7 +336,11 @@ async function main() {
   console.log('🔍 Deal Scout local scraper starting...')
   console.log(`   Min price: $${MIN_PRICE} | Min profit: $${MIN_PROFIT_DOLLARS} / ${MIN_PROFIT_PERCENT}%`)
   console.log(`   Categories: ${CL_CATEGORIES.map(c => c.label).join(', ')}`)
-  console.log(`   eBay comps: scraping sold listings (no API key needed)`)
+
+  // Fetch eBay token once — reused for entire run
+  console.log('\n🔑 Fetching eBay API token...')
+  const ebayToken = await getEbayToken()
+  console.log('   ✅ Token acquired')
 
   const results = { scraped: 0, scored: 0, qualified: 0, skipped: 0, errors: 0, noComps: 0 }
 
@@ -351,11 +362,14 @@ async function main() {
 
       if (existing) { results.skipped++; continue }
 
-      const comps = await fetchSoldComps(listing.title, listing.asking_price, listing.make, listing.model)
+      const comps = await fetchSoldComps(listing.title, listing.asking_price, ebayToken, listing.make, listing.model)
       const score = scoreDeal(listing, comps)
       results.scored++
 
       if (comps.length === 0) results.noComps++
+
+      // Per-listing progress so you can see comps coming through
+      console.log(`  [${i + 1}/${listings.length}] "${listing.title.slice(0, 45)}..." → ${comps.length} comps | profit: $${score.profit_potential}`)
 
       const { error } = await supabase.from('scored_deals').insert({
         platform: listing.platform,
@@ -383,16 +397,15 @@ async function main() {
         console.log(`  🔥 DEAL: ${listing.title} — $${score.profit_potential} profit (${score.profit_percent}%)`)
       }
 
-      // Progress log every 25 listings
+      // Summary every 25 listings
       if (results.scored % 25 === 0) {
-        const elapsed = Math.round((Date.now() - startTime) / 1000)
         const remaining = listings.length - i - 1 - results.skipped
-        const etaMins = Math.round((remaining * 2) / 60)
-        console.log(`  📊 Progress: ${results.scored} scored | ${results.noComps} no comps | ${comps.length} comps this one | ${results.qualified} qualified | ~${etaMins} min remaining`)
+        const etaMins = Math.round((remaining * 1) / 60) // ~1s per listing with API
+        console.log(`  📊 Progress: ${results.scored} scored | ${results.noComps} no comps | ${results.qualified} qualified | ~${etaMins} min remaining`)
       }
 
-      // 2-second delay between eBay requests — polite scraping
-      await sleep(2000)
+      // Small delay — Browse API is generous but be polite
+      await sleep(500)
     } catch (e: any) {
       console.error(`  Error scoring ${listing.external_id}:`, e.message)
       results.errors++
