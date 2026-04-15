@@ -266,14 +266,17 @@ async function fetchSoldComps(title: string, askingPrice: number, make?: string,
   const comps: EbayComp[] = []
   $('li.s-card').each((_, el) => {
     const item = $(el)
-    const text = item.text()
 
-    // Skip non-sold items (sponsored ads, etc.)
-    if (!text.includes('Sold')) return
+    // No 'Sold' text check needed — LH_Sold=1 already filters to sold-only results.
+    // The old check was silently dropping all results because the word "Sold"
+    // doesn't appear in the card text the way item.text() renders it.
+    const compTitle = (
+      item.find('.s-card__title, [role="heading"], .su-card-container__primary').first().text() || ''
+    ).replace(/Opens in.*/, '').trim()
 
-    const compTitle = (item.find('[role="heading"]').first().text() || '')
-      .replace(/Opens in.*/, '').trim()
-    const priceText = item.find('.s-card__price').text().trim()
+    // Use [class*=] so it matches even when the class has multiple names
+    // e.g. "su-styled-text positive bold large-1 s-card__price"
+    const priceText = item.find('[class*="s-card__price"]').first().text().trim()
     const price = parseFloat(priceText.replace(/[^0-9.]/g, ''))
 
     if (compTitle && price > 0) {
