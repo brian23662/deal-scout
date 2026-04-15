@@ -4,18 +4,40 @@ import DashboardClient from '@/components/DashboardClient'
 export const revalidate = 60
 
 export default async function DashboardPage() {
+  // Only fetch qualified deals, best score first
   const { data: deals } = await supabaseAdmin
     .from('scored_deals')
     .select('*')
-    .order('created_at', { ascending: false })
-    .limit(100)
+    .eq('qualifies', true)
+    .order('deal_score', { ascending: false })
+
+  // Accurate counts pulled separately so stats reflect the full table
+  const { count: totalCount } = await supabaseAdmin
+    .from('scored_deals')
+    .select('*', { count: 'exact', head: true })
+
+  const { count: qualifiedCount } = await supabaseAdmin
+    .from('scored_deals')
+    .select('*', { count: 'exact', head: true })
+    .eq('qualifies', true)
 
   const today = new Date().toDateString()
+  const { count: newTodayCount } = await supabaseAdmin
+    .from('scored_deals')
+    .select('*', { count: 'exact', head: true })
+    .eq('qualifies', true)
+    .gte('created_at', new Date(new Date().setHours(0, 0, 0, 0)).toISOString())
+
+  const { count: purchasedCount } = await supabaseAdmin
+    .from('scored_deals')
+    .select('*', { count: 'exact', head: true })
+    .eq('status', 'purchased')
+
   const stats = {
-    total: deals?.length || 0,
-    qualified: deals?.filter(d => d.qualifies).length || 0,
-    newToday: deals?.filter(d => new Date(d.created_at).toDateString() === today).length || 0,
-    purchased: deals?.filter(d => d.status === 'purchased').length || 0,
+    total: totalCount || 0,
+    qualified: qualifiedCount || 0,
+    newToday: newTodayCount || 0,
+    purchased: purchasedCount || 0,
   }
 
   return <DashboardClient deals={deals || []} stats={stats} />
