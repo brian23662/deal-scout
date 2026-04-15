@@ -2,6 +2,11 @@
 
 import { useState } from 'react'
 
+type Comp = {
+  title: string
+  sold_price: number
+}
+
 type Deal = {
   id: string
   platform: string
@@ -12,6 +17,7 @@ type Deal = {
   profit_percent: number
   deal_score: number
   comp_count: number
+  comps: Comp[]
   qualifies: boolean
   status: string
   location_city: string
@@ -206,8 +212,11 @@ function DealDetailPanel({ deal, onClose, onStatusChange }: {
   onClose: () => void
   onStatusChange: (id: string, status: string) => void
 }) {
+  const comps: Comp[] = Array.isArray(deal.comps) ? deal.comps : []
+  const median = deal.estimated_market_value
+
   return (
-    <div style={{ position: 'fixed', top: 0, right: 0, bottom: 0, width: 420, background: '#0c0c0c', borderLeft: '1px solid #1a1a1a', overflowY: 'auto', zIndex: 100, padding: 24 }}>
+    <div style={{ position: 'fixed', top: 0, right: 0, bottom: 0, width: 460, background: '#0c0c0c', borderLeft: '1px solid #1a1a1a', overflowY: 'auto', zIndex: 100, padding: 24 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 24 }}>
         <div style={{ fontSize: 10, letterSpacing: '3px', color: '#444' }}>DEAL DETAIL</div>
         <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', fontSize: 18 }}>✕</button>
@@ -221,11 +230,54 @@ function DealDetailPanel({ deal, onClose, onStatusChange }: {
       {/* Price breakdown */}
       <div style={{ background: '#111', borderRadius: 4, padding: 16, marginBottom: 16 }}>
         <DetailRow label="Asking Price" value={`$${deal.asking_price?.toLocaleString()}`} large />
-        <DetailRow label="Est. Market Value" value={`$${deal.estimated_market_value?.toLocaleString()}`} />
-        <DetailRow label="Profit Potential" value={`+$${deal.profit_potential?.toLocaleString()} (${deal.profit_percent}%)`} green />
+        <DetailRow label="Est. Market Value" value={deal.estimated_market_value ? `$${deal.estimated_market_value?.toLocaleString()}` : '—'} />
+        <DetailRow label="Profit Potential" value={deal.profit_potential ? `+$${deal.profit_potential?.toLocaleString()} (${deal.profit_percent}%)` : '—'} green={!!deal.profit_potential} />
         <DetailRow label="Deal Score" value={`${deal.deal_score}/100`} />
-        <DetailRow label="eBay Comps" value={`${deal.comp_count} sold listings`} />
+        <DetailRow label="eBay Comps" value={`${comps.length} sold listings`} />
       </div>
+
+      {/* eBay comps table */}
+      {comps.length > 0 ? (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 10, letterSpacing: '2px', color: '#444', marginBottom: 10 }}>EBAY SOLD COMPS</div>
+          <div style={{ background: '#111', borderRadius: 4, overflow: 'hidden' }}>
+            {comps
+              .slice()
+              .sort((a, b) => b.sold_price - a.sold_price)
+              .map((comp, i) => {
+                const isMedian = deal.estimated_market_value > 0 && comp.sold_price === median
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '8px 12px',
+                      borderBottom: i < comps.length - 1 ? '1px solid #1a1a1a' : 'none',
+                      background: isMedian ? '#22c55e08' : 'transparent',
+                    }}
+                  >
+                    <span style={{ fontSize: 11, color: '#777', flex: 1, marginRight: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {isMedian && <span style={{ color: '#22c55e', marginRight: 6 }}>▶</span>}
+                      {comp.title}
+                    </span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: isMedian ? '#22c55e' : '#ccc', whiteSpace: 'nowrap' }}>
+                      ${comp.sold_price.toLocaleString()}
+                    </span>
+                  </div>
+                )
+              })}
+          </div>
+          <div style={{ fontSize: 10, color: '#333', marginTop: 6, letterSpacing: '1px' }}>
+            ▶ = MEDIAN (used as market value)
+          </div>
+        </div>
+      ) : (
+        <div style={{ background: '#111', borderRadius: 4, padding: 16, marginBottom: 16, fontSize: 12, color: '#444', textAlign: 'center', letterSpacing: '1px' }}>
+          NO COMPS FOUND
+        </div>
+      )}
 
       {/* Status buttons */}
       <div style={{ marginBottom: 24 }}>

@@ -234,7 +234,6 @@ async function fetchSoldComps(
   make?: string,
   model?: string,
 ): Promise<EbayComp[]> {
-  // Build a focused search query from the listing title
   const stopWords = new Set([
     'for', 'sale', 'by', 'owner', 'obo', 'or', 'best', 'offer', 'new', 'used',
     'great', 'condition', 'like', 'works', 'good', 'with', 'and', 'the', 'inch',
@@ -257,7 +256,6 @@ async function fetchSoldComps(
       .filter(w => w.length > 2 && !stopWords.has(w)).slice(0, 5).join(' ')
   }
 
-  // Min comp price = 25% of asking — filters out parts/accessories
   const minCompPrice = Math.max(100, Math.round(askingPrice * 0.25))
 
   const params = new URLSearchParams({
@@ -337,7 +335,6 @@ async function main() {
   console.log(`   Min price: $${MIN_PRICE} | Min profit: $${MIN_PROFIT_DOLLARS} / ${MIN_PROFIT_PERCENT}%`)
   console.log(`   Categories: ${CL_CATEGORIES.map(c => c.label).join(', ')}`)
 
-  // Fetch eBay token once — reused for entire run
   console.log('\n🔑 Fetching eBay API token...')
   const ebayToken = await getEbayToken()
   console.log('   ✅ Token acquired')
@@ -350,7 +347,6 @@ async function main() {
   console.log(`\n✅ Scraped ${listings.length} listings total`)
 
   console.log('\n📊 Scoring against eBay sold comps...')
-  const startTime = Date.now()
   for (let i = 0; i < listings.length; i++) {
     const listing = listings[i]
     try {
@@ -368,7 +364,6 @@ async function main() {
 
       if (comps.length === 0) results.noComps++
 
-      // Per-listing progress so you can see comps coming through
       console.log(`  [${i + 1}/${listings.length}] "${listing.title.slice(0, 45)}..." → ${comps.length} comps | profit: $${score.profit_potential}`)
 
       const { error } = await supabase.from('scored_deals').insert({
@@ -385,6 +380,7 @@ async function main() {
         url: listing.url,
         image_urls: listing.image_urls,
         posted_at: listing.posted_at || null,
+        comps: comps,  // save full comp list to JSONB column
         ...score,
         status: 'new',
         alert_sent: false,
@@ -397,14 +393,12 @@ async function main() {
         console.log(`  🔥 DEAL: ${listing.title} — $${score.profit_potential} profit (${score.profit_percent}%)`)
       }
 
-      // Summary every 25 listings
       if (results.scored % 25 === 0) {
         const remaining = listings.length - i - 1 - results.skipped
-        const etaMins = Math.round((remaining * 1) / 60) // ~1s per listing with API
+        const etaMins = Math.round((remaining * 1) / 60)
         console.log(`  📊 Progress: ${results.scored} scored | ${results.noComps} no comps | ${results.qualified} qualified | ~${etaMins} min remaining`)
       }
 
-      // Small delay — Browse API is generous but be polite
       await sleep(500)
     } catch (e: any) {
       console.error(`  Error scoring ${listing.external_id}:`, e.message)
