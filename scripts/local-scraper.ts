@@ -223,7 +223,7 @@ async function getEbayToken(): Promise<string> {
     throw new Error(`eBay auth failed: HTTP ${res.status} — ${text}`)
   }
 
-  const data = await res.json()
+  const data = await res.json() as any
   return data.access_token
 }
 
@@ -283,7 +283,7 @@ async function fetchSoldComps(
     throw new Error(`eBay Browse API error: HTTP ${res.status} — ${text}`)
   }
 
-  const data = await res.json()
+  const data = await res.json() as any
   const items: any[] = data.itemSummaries || []
 
   return items
