@@ -124,36 +124,49 @@ async function scrapeMarket(
   const jsonData = JSON.parse(jsonLdText)
   const items: any[] = jsonData?.itemListElement || []
 
-  // Also grab URLs from anchor tags (JSON-LD omits them)
-  const urls: string[] = []
+  // Build a map of post ID → full URL from anchor tags.
+  // This is more reliable than index-based alignment since anchor tag
+  // order doesn't always match JSON-LD order.
+  const urlMap = new Map<string, string>()
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || ''
-    if (/\/\d{10}\.html/.test(href)) {
+    const match = href.match(/\/(\d{10})\.html/)
+    if (match) {
+      const postId = match[1]
       const full = href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`
-      if (!urls.includes(full)) urls.push(full)
+      if (!urlMap.has(postId)) urlMap.set(postId, full)
     }
   })
 
   const listings: Listing[] = []
-  for (let i = 0; i < items.length; i++) {
+  const seen = new Set<string>()
+
+  for (const element of items) {
     try {
-      const item = items[i]?.item
+      const item = element?.item
       if (!item) continue
 
       const title: string = item.name || ''
       const price = parseFloat(item.offers?.price || '0')
       const images: string[] = Array.isArray(item.image) ? item.image : (item.image ? [item.image] : [])
-      const itemUrl = urls[i] || ''
 
       if (!price || price < MIN_PRICE) continue
+
+      // Extract the post ID from the JSON-LD item's @id or url field,
+      // then look it up in our urlMap for a reliable match.
+      const idField: string = item['@id'] || item.url || ''
+      const postId = idField.match(/\/(\d{10})(?:\.html)?/)?.[1]
+      if (!postId) continue
+
+      const itemUrl = urlMap.get(postId)
       if (!itemUrl) continue
 
-      const externalId = itemUrl.match(/\/(\d{10})\.html/)?.[1]
-      if (!externalId) continue
+      if (seen.has(postId)) continue
+      seen.add(postId)
 
       listings.push({
         platform: 'craigslist',
-        external_id: externalId,
+        external_id: postId,
         title,
         asking_price: price,
         make: extractMake(title),
@@ -227,6 +240,64 @@ async function getEbayToken(): Promise<string> {
   return data.access_token
 }
 
+// ─── Spec token extraction ────────────────────────────────────────────────────
+//
+// Extracts the key "spec tokens" from a listing title — numbers with units,
+// model numbers, and significant standalone numbers. These are used to filter
+// comps so only items that share a spec token with the listing count.
+//
+// Examples:
+//   "3.5 Ton Condenser"       → ["3.5", "ton"]
+//   "Generac 7500w Generator" → ["7500", "7500w", "generac"]
+//   "Husqvarna Z254 Mower"    → ["z254", "husqvarna"]
+//   "20 inch Floor Burnisher" → ["20", "20in", "burnisher"]
+
+function extractSpecTokens(title: string): string[] {
+  const lower = title.toLowerCase()
+  const tokens = new Set<string>()
+
+  // Numbers with units: 3.5ton, 7500w, 20hp, 48v, 60hz, 3500psi, 20gpm, etc.
+  const unitPatterns = /(\d+\.?\d*)\s*(ton|hp|kw|kva|watt|w|volt|v|amp|a|psi|gpm|gal|gallon|inch|in|cc|rpm|hz|btu|seer|cu\.?\s*ft)/gi
+  let m: RegExpExecArray | null
+  while ((m = unitPatterns.exec(lower)) !== null) {
+    tokens.add(m[1])               // bare number: "3.5"
+    tokens.add(m[1] + m[2].replace(/\s/g, ''))  // combined: "3.5ton"
+  }
+
+  // Standalone significant numbers (likely wattage, model digits, size)
+  const numberPattern = /\b(\d{3,6})\b/g
+  while ((m = numberPattern.exec(lower)) !== null) {
+    tokens.add(m[1])
+  }
+
+  // Model numbers: letter+digit combos like Z254, XP8000E, TS248XD
+  const modelPattern = /\b([a-z]{1,4}\d{2,6}[a-z]?|[a-z]?\d{2,6}[a-z]{1,4})\b/gi
+  while ((m = modelPattern.exec(lower)) !== null) {
+    tokens.add(m[1].toLowerCase())
+  }
+
+  // Brand names that are meaningful specs (not generic)
+  const specBrands = ['generac', 'honda', 'husqvarna', 'kubota', 'deere', 'toro', 'scag',
+    'exmark', 'gravely', 'ferris', 'ariens', 'viking', 'miele', 'garland', 'greenlee',
+    'donaldson', 'alto', 'combitherm', 'samsung', 'lg', 'bosch', 'dewalt', 'milwaukee']
+  for (const brand of specBrands) {
+    if (lower.includes(brand)) tokens.add(brand)
+  }
+
+  return Array.from(tokens)
+}
+
+// Returns true if the comp title shares at least one spec token with the listing.
+// Falls back to true (no filtering) if no spec tokens could be extracted —
+// better to include a questionable comp than discard all of them.
+function compMatchesListing(listingTitle: string, compTitle: string): boolean {
+  const specTokens = extractSpecTokens(listingTitle)
+  if (specTokens.length === 0) return true  // can't filter, accept all
+
+  const compLower = compTitle.toLowerCase()
+  return specTokens.some(token => compLower.includes(token))
+}
+
 async function fetchSoldComps(
   title: string,
   askingPrice: number,
@@ -284,12 +355,21 @@ async function fetchSoldComps(
   const data = await res.json() as any
   const items: any[] = data.itemSummaries || []
 
-  return items
+  const raw: EbayComp[] = items
     .map((item: any) => ({
       sold_price: parseFloat(item.price?.value || '0'),
       title: item.title || '',
     }))
     .filter(c => c.sold_price > 0 && c.title)
+
+  // Filter to comps that share at least one spec token with the listing.
+  // This prevents a 5-ton HVAC comp from pricing a 3.5-ton listing,
+  // or a 3500w generator comp from pricing a 7000w generator.
+  const filtered = raw.filter(c => compMatchesListing(title, c.title))
+
+  // If filtering removed everything, fall back to unfiltered — better than
+  // no comps at all, and the dashboard will show them for manual review.
+  return filtered.length > 0 ? filtered : raw
 }
 
 function calculateMarketValue(comps: EbayComp[]): number {
@@ -380,7 +460,7 @@ async function main() {
         url: listing.url,
         image_urls: listing.image_urls,
         posted_at: listing.posted_at || null,
-        comps: comps,  // save full comp list to JSONB column
+        comps: comps,
         ...score,
         status: 'new',
         alert_sent: false,
@@ -427,7 +507,7 @@ const BRANDS = [
   'Club Car', 'EZGO', 'Yamaha', 'Honda', 'Generac', 'DeWalt', 'Milwaukee',
 ]
 function extractMake(t: string) { return BRANDS.find(b => t.toUpperCase().includes(b.toUpperCase())) }
-function extractModel(t: string) { return t.match(/\b([A-Z]{1,3}[-\s]?\d{3,5}[A-Z]?|ZT\s\w+)\b/i)?.[0] }
+function extractModel(t: string) { return t.match(/\b([A-Z]{1,4}\d{2,6}[A-Z]?|\d{2,6}[A-Z]{1,4})\b/i)?.[0] }
 function extractHours(t: string) { const m = t.match(/(\d+)\s*(?:hours?|hrs?)/i); return m ? parseInt(m[1]) : undefined }
 
 main().catch(console.error)
