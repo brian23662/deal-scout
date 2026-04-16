@@ -99,15 +99,18 @@ async function scrapeMarketCategory(
   const jsonData = JSON.parse(jsonLdText)
   const items: any[] = jsonData?.itemListElement || []
 
-  // Grab listing URLs from anchor tags — JSON-LD omits them
-  const urls: string[] = []
+  // Build a Map of { listingId -> full URL } from anchor tags.
+  // Using a Map keyed by the 10-digit listing ID makes the lookup
+  // position-independent — extra nav/footer links can't shift the pairing.
+  const urlMap = new Map<string, string>()
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || ''
-    if (/\/\d{10}\.html/.test(href)) {
+    const idMatch = href.match(/\/(\d{10})\.html/)
+    if (idMatch) {
       const full = href.startsWith('http')
         ? href
         : `https://${market.subdomain}.craigslist.org${href}`
-      if (!urls.includes(full)) urls.push(full)
+      urlMap.set(idMatch[1], full)
     }
   })
 
@@ -122,17 +125,20 @@ async function scrapeMarketCategory(
       const images: string[] = Array.isArray(item.image)
         ? item.image
         : item.image ? [item.image] : []
-      const itemUrl = urls[i] || ''
 
-      if (!price || price < MIN_PRICE) continue
+      // Extract the listing ID from the JSON-LD item's own url field,
+      // then look up the full URL in the map. This guarantees title and
+      // URL always refer to the same listing.
+      const itemId = item.url?.match(/\/(\d{10})\.html/)?.[1]
+      if (!itemId) continue
+      const itemUrl = urlMap.get(itemId)
       if (!itemUrl) continue
 
-      const externalId = itemUrl.match(/\/(\d{10})\.html/)?.[1]
-      if (!externalId) continue
+      if (!price || price < MIN_PRICE) continue
 
       listings.push({
         platform: 'craigslist',
-        external_id: externalId,
+        external_id: itemId,
         title,
         asking_price: price,
         make: extractMake(title),
