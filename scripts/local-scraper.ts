@@ -93,6 +93,11 @@ interface EbayComp {
 
 // ─── Craigslist Scraper ───────────────────────────────────────────────────────
 
+// Extract a 10-digit Craigslist post ID from any string containing it
+function extractPostId(s: string): string | null {
+  return s?.match(/\/(\d{10})(?:\.html)?/)?.[1] ?? null
+}
+
 async function scrapeMarket(
   market: typeof FL_MARKETS[0],
   categoryCode: string,
@@ -124,25 +129,29 @@ async function scrapeMarket(
   const jsonData = JSON.parse(jsonLdText)
   const items: any[] = jsonData?.itemListElement || []
 
-  // Build a map of post ID → full URL from anchor tags.
-  // This is more reliable than index-based alignment since anchor tag
-  // order doesn't always match JSON-LD order.
+  // Build two lookup structures from anchor tags:
+  // 1. postId → full URL (for reliable ID-based matching)
+  // 2. ordered list of URLs (fallback index-based matching)
   const urlMap = new Map<string, string>()
+  const urlList: string[] = []
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || ''
-    const match = href.match(/\/(\d{10})\.html/)
-    if (match) {
-      const postId = match[1]
+    if (/\/\d{10}\.html/.test(href)) {
       const full = href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`
-      if (!urlMap.has(postId)) urlMap.set(postId, full)
+      const postId = extractPostId(href)
+      if (postId && !urlMap.has(postId)) {
+        urlMap.set(postId, full)
+        urlList.push(full)
+      }
     }
   })
 
   const listings: Listing[] = []
   const seen = new Set<string>()
 
-  for (const element of items) {
+  for (let i = 0; i < items.length; i++) {
     try {
+      const element = items[i]
       const item = element?.item
       if (!item) continue
 
@@ -152,15 +161,33 @@ async function scrapeMarket(
 
       if (!price || price < MIN_PRICE) continue
 
-      // Extract the post ID from the JSON-LD item's @id or url field,
-      // then look it up in our urlMap for a reliable match.
-      const idField: string = item['@id'] || item.url || ''
-      const postId = idField.match(/\/(\d{10})(?:\.html)?/)?.[1]
-      if (!postId) continue
+      // Try to extract post ID from multiple possible JSON-LD fields.
+      // Craigslist puts it on the parent element's 'url', the item's 'url',
+      // or the item's '@id'. Check all three, fall back to index position.
+      const candidateFields = [
+        element?.url,
+        element?.['@id'],
+        item?.url,
+        item?.['@id'],
+      ]
+      let postId: string | null = null
+      for (const field of candidateFields) {
+        postId = extractPostId(field ?? '')
+        if (postId) break
+      }
 
-      const itemUrl = urlMap.get(postId)
-      if (!itemUrl) continue
+      let itemUrl: string | undefined
+      if (postId && urlMap.has(postId)) {
+        // Best case: matched by post ID
+        itemUrl = urlMap.get(postId)
+      } else {
+        // Fallback: use index position (original behavior)
+        // This still has the alignment risk but is better than dropping the listing
+        itemUrl = urlList[i]
+        if (itemUrl) postId = extractPostId(itemUrl)
+      }
 
+      if (!itemUrl || !postId) continue
       if (seen.has(postId)) continue
       seen.add(postId)
 
@@ -250,7 +277,6 @@ async function getEbayToken(): Promise<string> {
 //   "3.5 Ton Condenser"       → ["3.5", "ton"]
 //   "Generac 7500w Generator" → ["7500", "7500w", "generac"]
 //   "Husqvarna Z254 Mower"    → ["z254", "husqvarna"]
-//   "20 inch Floor Burnisher" → ["20", "20in", "burnisher"]
 
 function extractSpecTokens(title: string): string[] {
   const lower = title.toLowerCase()
@@ -260,8 +286,8 @@ function extractSpecTokens(title: string): string[] {
   const unitPatterns = /(\d+\.?\d*)\s*(ton|hp|kw|kva|watt|w|volt|v|amp|a|psi|gpm|gal|gallon|inch|in|cc|rpm|hz|btu|seer|cu\.?\s*ft)/gi
   let m: RegExpExecArray | null
   while ((m = unitPatterns.exec(lower)) !== null) {
-    tokens.add(m[1])               // bare number: "3.5"
-    tokens.add(m[1] + m[2].replace(/\s/g, ''))  // combined: "3.5ton"
+    tokens.add(m[1])
+    tokens.add(m[1] + m[2].replace(/\s/g, ''))
   }
 
   // Standalone significant numbers (likely wattage, model digits, size)
@@ -276,7 +302,7 @@ function extractSpecTokens(title: string): string[] {
     tokens.add(m[1].toLowerCase())
   }
 
-  // Brand names that are meaningful specs (not generic)
+  // Brand names that are meaningful specs
   const specBrands = ['generac', 'honda', 'husqvarna', 'kubota', 'deere', 'toro', 'scag',
     'exmark', 'gravely', 'ferris', 'ariens', 'viking', 'miele', 'garland', 'greenlee',
     'donaldson', 'alto', 'combitherm', 'samsung', 'lg', 'bosch', 'dewalt', 'milwaukee']
@@ -287,13 +313,9 @@ function extractSpecTokens(title: string): string[] {
   return Array.from(tokens)
 }
 
-// Returns true if the comp title shares at least one spec token with the listing.
-// Falls back to true (no filtering) if no spec tokens could be extracted —
-// better to include a questionable comp than discard all of them.
 function compMatchesListing(listingTitle: string, compTitle: string): boolean {
   const specTokens = extractSpecTokens(listingTitle)
-  if (specTokens.length === 0) return true  // can't filter, accept all
-
+  if (specTokens.length === 0) return true
   const compLower = compTitle.toLowerCase()
   return specTokens.some(token => compLower.includes(token))
 }
@@ -362,13 +384,7 @@ async function fetchSoldComps(
     }))
     .filter(c => c.sold_price > 0 && c.title)
 
-  // Filter to comps that share at least one spec token with the listing.
-  // This prevents a 5-ton HVAC comp from pricing a 3.5-ton listing,
-  // or a 3500w generator comp from pricing a 7000w generator.
   const filtered = raw.filter(c => compMatchesListing(title, c.title))
-
-  // If filtering removed everything, fall back to unfiltered — better than
-  // no comps at all, and the dashboard will show them for manual review.
   return filtered.length > 0 ? filtered : raw
 }
 
