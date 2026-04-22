@@ -129,27 +129,32 @@ async function scrapeMarket(
   const jsonData = JSON.parse(jsonLdText)
   const items: any[] = jsonData?.itemListElement || []
 
-  // Build two lookup structures from anchor tags:
-  // 1. postId → full URL (for reliable ID-based matching)
-  // 2. ordered list of URLs (fallback index-based matching)
-  const urlMap = new Map<string, string>()
-  const urlList: string[] = []
-  $('a[href]').each((_, el) => {
-    const href = $(el).attr('href') || ''
-    if (/\/\d{10}\.html/.test(href)) {
-      const full = href.startsWith('http') ? href : `https://${market.subdomain}.craigslist.org${href}`
-      const postId = extractPostId(href)
-      if (postId && !urlMap.has(postId)) {
-        urlMap.set(postId, full)
-        urlList.push(full)
-      }
-    }
-  })
+  // Pair JSON-LD items with their listing URLs using scoped CSS selectors.
+  //
+  // Craigslist wraps each search result in a `li.cl-static-search-result`
+  // container that holds exactly one listing anchor. This gives us a
+  // guaranteed 1:1 pairing with `items[i]` — no post-ID extraction needed
+  // (the JSON-LD doesn't expose post IDs anywhere), no index drift from
+  // cross-market deduping, no risk of sidebar nav links polluting the index.
+  //
+  // Verified against tampa/grq and daytona/app via diagnose-url-alignment.ts:
+  // container count matched JSON-LD count exactly, titles matched in every
+  // sampled item. Previous approach (global `a[href]` scan + index pairing)
+  // produced a ~63% mismatch rate in production data.
+  const containers = $('li.cl-static-search-result').toArray()
+  if (containers.length !== items.length) {
+    console.warn(
+      `  Container/JSON-LD count mismatch for ${market.subdomain}/${categoryLabel}: ` +
+      `${containers.length} li.cl-static-search-result vs ${items.length} items. ` +
+      `Scraping what we can.`
+    )
+  }
 
   const listings: Listing[] = []
   const seen = new Set<string>()
+  const pairCount = Math.min(containers.length, items.length)
 
-  for (let i = 0; i < items.length; i++) {
+  for (let i = 0; i < pairCount; i++) {
     try {
       const element = items[i]
       const item = element?.item
@@ -161,33 +166,18 @@ async function scrapeMarket(
 
       if (!price || price < MIN_PRICE) continue
 
-      // Try to extract post ID from multiple possible JSON-LD fields.
-      // Craigslist puts it on the parent element's 'url', the item's 'url',
-      // or the item's '@id'. Check all three, fall back to index position.
-      const candidateFields = [
-        element?.url,
-        element?.['@id'],
-        item?.url,
-        item?.['@id'],
-      ]
-      let postId: string | null = null
-      for (const field of candidateFields) {
-        postId = extractPostId(field ?? '')
-        if (postId) break
-      }
+      // Pull the single listing anchor from inside the scoped container.
+      const container = containers[i]
+      const anchor = $(container).find('a[href]')
+        .filter((_, a) => /\/\d{10}\.html/.test($(a).attr('href') || ''))
+        .first()
+      const href = anchor.attr('href') || ''
+      const postId = extractPostId(href)
+      if (!postId) continue
+      const itemUrl = href.startsWith('http')
+        ? href
+        : `https://${market.subdomain}.craigslist.org${href}`
 
-      let itemUrl: string | undefined
-      if (postId && urlMap.has(postId)) {
-        // Best case: matched by post ID
-        itemUrl = urlMap.get(postId)
-      } else {
-        // Fallback: use index position (original behavior)
-        // This still has the alignment risk but is better than dropping the listing
-        itemUrl = urlList[i]
-        if (itemUrl) postId = extractPostId(itemUrl)
-      }
-
-      if (!itemUrl || !postId) continue
       if (seen.has(postId)) continue
       seen.add(postId)
 
