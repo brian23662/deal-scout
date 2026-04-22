@@ -7,6 +7,7 @@ type ApiSuccess = { ok: true; row: QuickComp; ebayError?: string }
 type ApiNeedsManual = {
   ok: false
   needsManualEntry: true
+  isKnownSpa?: boolean
   extracted: {
     source_url: string
     source_domain: string
@@ -79,12 +80,10 @@ export default function QuickCompClient({ history }: { history: QuickComp[] }) {
           <div style={{ fontSize: 10, letterSpacing: '4px', color: '#444', marginBottom: 2 }}>DEAL SCOUT</div>
           <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: '2px', color: '#fff' }}>QUICK COMP</div>
         </div>
-        <a
-          href="/dashboard"
-          style={{ fontSize: 10, letterSpacing: '2px', color: '#666', textDecoration: 'none' }}
-        >
-          DASHBOARD →
-        </a>
+        <div style={{ display: 'flex', gap: 16 }}>
+          <a href="/" style={{ fontSize: 10, letterSpacing: '2px', color: '#666', textDecoration: 'none' }}>← HOME</a>
+          <a href="/dashboard" style={{ fontSize: 10, letterSpacing: '2px', color: '#666', textDecoration: 'none' }}>DASHBOARD →</a>
+        </div>
       </header>
 
       <div style={{ padding: 24, maxWidth: 900, margin: '0 auto' }}>
@@ -122,7 +121,7 @@ export default function QuickCompClient({ history }: { history: QuickComp[] }) {
             </button>
           </div>
           <div style={{ fontSize: 10, color: '#444', marginTop: 6, letterSpacing: '1px' }}>
-            SUPPORTS CRAIGSLIST · EBAY · GOVDEALS · HIBID · GENERIC FALLBACK
+            AUTO-EXTRACTS FROM CRAIGSLIST AND EBAY · MANUAL ENTRY FOR GOVDEALS, HIBID, FACEBOOK
           </div>
         </div>
 
@@ -134,56 +133,17 @@ export default function QuickCompClient({ history }: { history: QuickComp[] }) {
         )}
 
         {result && isManualNeeded(result) && (
-          <div style={{ background: '#111', border: '1px solid #222', padding: 16, borderRadius: 4, marginBottom: 24 }}>
-            <div style={{ fontSize: 10, letterSpacing: '2px', color: '#f59e0b', marginBottom: 12 }}>
-              AUTO-EXTRACT INCOMPLETE — FILL IN MANUALLY
-            </div>
-            <div style={{ fontSize: 11, color: '#555', marginBottom: 16 }}>
-              Source: {result.extracted.source_domain} · Method: {result.extracted.extraction_method}
-            </div>
-
-            <label style={{ fontSize: 10, letterSpacing: '2px', color: '#666', display: 'block', marginBottom: 6 }}>
-              TITLE
-            </label>
-            <input
-              value={manualTitle}
-              onChange={e => setManualTitle(e.target.value)}
-              placeholder="e.g. 2019 Toro TimeCutter SS5000 50 inch"
-              style={{
-                width: '100%', background: '#0c0c0c', border: '1px solid #222', color: '#e5e5e5',
-                padding: '10px 12px', borderRadius: 4, fontSize: 13, fontFamily: 'inherit',
-                outline: 'none', marginBottom: 12, boxSizing: 'border-box',
-              }}
-            />
-
-            <label style={{ fontSize: 10, letterSpacing: '2px', color: '#666', display: 'block', marginBottom: 6 }}>
-              ASKING PRICE (USD)
-            </label>
-            <input
-              type="number"
-              value={manualPrice}
-              onChange={e => setManualPrice(e.target.value)}
-              placeholder="e.g. 2800"
-              style={{
-                width: '100%', background: '#0c0c0c', border: '1px solid #222', color: '#e5e5e5',
-                padding: '10px 12px', borderRadius: 4, fontSize: 13, fontFamily: 'inherit',
-                outline: 'none', marginBottom: 16, boxSizing: 'border-box',
-              }}
-            />
-
-            <button
-              onClick={handleManualSubmit}
-              disabled={loading || !manualTitle.trim() || !manualPrice}
-              style={{
-                padding: '10px 20px', background: loading ? '#222' : '#fff',
-                color: loading ? '#666' : '#000', border: 'none', borderRadius: 4,
-                fontFamily: 'inherit', fontSize: 11, fontWeight: 700, letterSpacing: '2px',
-                cursor: loading ? 'not-allowed' : 'pointer',
-              }}
-            >
-              {loading ? 'RUNNING...' : 'RUN COMPS'}
-            </button>
-          </div>
+          <ManualEntryPanel
+            isKnownSpa={!!result.isKnownSpa}
+            domain={result.extracted.source_domain}
+            method={result.extracted.extraction_method}
+            title={manualTitle}
+            price={manualPrice}
+            onTitleChange={setManualTitle}
+            onPriceChange={setManualPrice}
+            onSubmit={handleManualSubmit}
+            loading={loading}
+          />
         )}
 
         {result && isSuccess(result) && (
@@ -224,6 +184,79 @@ export default function QuickCompClient({ history }: { history: QuickComp[] }) {
 }
 
 // ---------- Subcomponents ----------
+
+function ManualEntryPanel({
+  isKnownSpa, domain, method, title, price, onTitleChange, onPriceChange, onSubmit, loading,
+}: {
+  isKnownSpa: boolean
+  domain: string
+  method: ExtractionMethod
+  title: string
+  price: string
+  onTitleChange: (v: string) => void
+  onPriceChange: (v: string) => void
+  onSubmit: () => void
+  loading: boolean
+}) {
+  const heading = isKnownSpa ? 'MANUAL ENTRY' : 'AUTO-EXTRACT INCOMPLETE — FILL IN MANUALLY'
+  const subline = isKnownSpa
+    ? `${domain} requires manual entry — their pages are built after load, so we can't read them server-side. Type the title and price and we'll run the comps.`
+    : `Source: ${domain} · Method: ${method}`
+  const headingColor = isKnownSpa ? '#60a5fa' : '#f59e0b'
+
+  return (
+    <div style={{ background: '#111', border: '1px solid #222', padding: 16, borderRadius: 4, marginBottom: 24 }}>
+      <div style={{ fontSize: 10, letterSpacing: '2px', color: headingColor, marginBottom: 12 }}>
+        {heading}
+      </div>
+      <div style={{ fontSize: 11, color: '#777', marginBottom: 16, lineHeight: 1.5 }}>
+        {subline}
+      </div>
+
+      <label style={{ fontSize: 10, letterSpacing: '2px', color: '#666', display: 'block', marginBottom: 6 }}>
+        TITLE
+      </label>
+      <input
+        value={title}
+        onChange={e => onTitleChange(e.target.value)}
+        placeholder="e.g. 2019 Toro TimeCutter SS5000 50 inch"
+        style={{
+          width: '100%', background: '#0c0c0c', border: '1px solid #222', color: '#e5e5e5',
+          padding: '10px 12px', borderRadius: 4, fontSize: 13, fontFamily: 'inherit',
+          outline: 'none', marginBottom: 12, boxSizing: 'border-box',
+        }}
+      />
+
+      <label style={{ fontSize: 10, letterSpacing: '2px', color: '#666', display: 'block', marginBottom: 6 }}>
+        ASKING PRICE (USD)
+      </label>
+      <input
+        type="number"
+        value={price}
+        onChange={e => onPriceChange(e.target.value)}
+        placeholder="e.g. 2800"
+        style={{
+          width: '100%', background: '#0c0c0c', border: '1px solid #222', color: '#e5e5e5',
+          padding: '10px 12px', borderRadius: 4, fontSize: 13, fontFamily: 'inherit',
+          outline: 'none', marginBottom: 16, boxSizing: 'border-box',
+        }}
+      />
+
+      <button
+        onClick={onSubmit}
+        disabled={loading || !title.trim() || !price}
+        style={{
+          padding: '10px 20px', background: loading ? '#222' : '#fff',
+          color: loading ? '#666' : '#000', border: 'none', borderRadius: 4,
+          fontFamily: 'inherit', fontSize: 11, fontWeight: 700, letterSpacing: '2px',
+          cursor: loading ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {loading ? 'RUNNING...' : 'RUN COMPS'}
+      </button>
+    </div>
+  )
+}
 
 function QuickCompResult({ row, ebayError }: { row: QuickComp; ebayError?: string }) {
   const profitColor = (row.estimated_profit || 0) > 0 ? '#22c55e' : '#ef4444'

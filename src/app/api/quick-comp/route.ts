@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
-import { extractFromUrl } from '@/lib/extractors'
+import { extractFromUrl, isKnownSpaHost, getDomain } from '@/lib/extractors'
 import { fetchSoldComps } from '@/lib/ebay/client'
 import { filterRelevantComps } from '@/lib/ebay/relevance'
 import { EbayComp, ExtractionMethod, QuickCompSoldItem } from '@/types'
@@ -61,6 +61,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       ok: false,
       needsManualEntry: true,
+      isKnownSpa: isKnownSpaHost(getDomain(url)),
       extracted: {
         source_url: url,
         source_domain: sourceDomain,

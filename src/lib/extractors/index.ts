@@ -32,6 +32,22 @@ export function getDomain(url: string): string {
 }
 
 /**
+ * Sites that render their listing pages entirely client-side (SPAs).
+ * A raw server-side fetch returns a skeleton HTML page with no listing
+ * data in it, so we don't even try to extract — we skip straight to
+ * the manual form. Faster and more honest than pretending to try.
+ */
+const SPA_HOSTS = [
+  'govdeals.com',
+  'hibid.com',
+  'facebook.com',
+]
+
+export function isKnownSpaHost(domain: string): boolean {
+  return SPA_HOSTS.some(h => domain === h || domain.endsWith('.' + h))
+}
+
+/**
  * Main entry: given a URL, dispatch to the right site-specific extractor,
  * falling back to generic OpenGraph / JSON-LD if the site match fails
  * or produces no data.
@@ -41,6 +57,15 @@ export function getDomain(url: string): string {
  */
 export async function extractFromUrl(url: string): Promise<ExtractedListing> {
   const domain = getDomain(url)
+
+  // Known SPA hosts: skip extraction, go straight to manual entry.
+  if (isKnownSpaHost(domain)) {
+    return {
+      source_url: url,
+      source_domain: domain,
+      extraction_method: 'manual',
+    }
+  }
 
   // Site dispatch — order matters, most specific first
   try {
