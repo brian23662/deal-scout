@@ -75,3 +75,54 @@ export interface EbayToken {
   expires_in: number
   token_type: string
 }
+
+// ----- Quick Comp types -----
+
+export type ExtractionMethod =
+  | 'craigslist'
+  | 'ebay'
+  | 'govdeals'
+  | 'hibid'
+  | 'opengraph'
+  | 'jsonld'
+  | 'manual'
+
+/**
+ * What an extractor returns from a pasted URL.
+ * title and asking_price may be undefined if extraction failed —
+ * the UI will show a manual-entry form in that case.
+ */
+export interface ExtractedListing {
+  source_url: string
+  source_domain: string
+  title?: string
+  asking_price?: number
+  extraction_method: ExtractionMethod
+}
+
+/**
+ * A single Quick Comp lookup row (matches the quick_comps table).
+ * `comps` stores the filtered, relevant eBay sold listings we used.
+ */
+export interface QuickComp {
+  id?: string
+  created_at?: string
+  source_url: string
+  source_domain: string | null
+  title: string | null
+  asking_price: number | null
+  ebay_query: string | null
+  comps: QuickCompSoldItem[] | null
+  comp_count: number | null
+  median_price: number | null
+  estimated_profit: number | null
+  extraction_method: ExtractionMethod | null
+  notes: string | null
+}
+
+export interface QuickCompSoldItem {
+  title: string
+  price: number
+  url: string
+  endedAt: string
+}
