@@ -46,6 +46,7 @@ export interface DealScore {
   profit_percent: number
   score: number
   qualifies: boolean
+  low_confidence: boolean
   comps_used: EbayComp[]
 }
 
@@ -67,6 +68,7 @@ export interface ScoringConfig {
   minProfitDollars: number
   minProfitPercent: number
   maxDistanceMiles: number
+  minCompCount: number
   homeZip: string
 }
 
