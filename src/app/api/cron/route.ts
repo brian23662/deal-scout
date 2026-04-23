@@ -36,16 +36,6 @@ export async function POST(req: NextRequest) {
       console.log(`Craigslist: ${clListings.length} listings`)
     } catch (e: any) { results.errors.push(`Craigslist: ${e.message}`) }
 
-    // Facebook via Apify (when token present)
-    if (process.env.APIFY_API_TOKEN) {
-      try {
-        const { scrapeMarketplace } = await import('@/lib/scrapers/facebook')
-        const fbListings = await scrapeMarketplace()
-        allListings.push(...fbListings)
-        console.log(`Facebook: ${fbListings.length} listings`)
-      } catch (e: any) { results.errors.push(`Facebook: ${e.message}`) }
-    }
-
     results.scraped = allListings.length
     console.log(`Total scraped: ${allListings.length}`)
 
