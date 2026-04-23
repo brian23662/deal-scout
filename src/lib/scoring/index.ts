@@ -5,6 +5,7 @@ export const DEFAULT_CONFIG: ScoringConfig = {
   minProfitDollars: parseInt(process.env.MIN_PROFIT_DOLLARS || '600'),
   minProfitPercent: parseInt(process.env.MIN_PROFIT_PERCENT || '20'),
   maxDistanceMiles: parseInt(process.env.MAX_DISTANCE_MILES || '240'),
+  minCompCount: parseInt(process.env.MIN_COMP_COUNT || '10'),
   homeZip: process.env.HOME_ZIP || '32174',
 }
 
@@ -12,7 +13,17 @@ export function scoreDeal(listing: Listing, comps: EbayComp[], config: ScoringCo
   const { marketValue, sampleSize } = calculateMarketValue(comps)
 
   if (marketValue === 0 || sampleSize === 0) {
-    return { listing_id: listing.external_id, estimated_market_value: 0, comp_count: 0, profit_potential: 0, profit_percent: 0, score: 0, qualifies: false, comps_used: [] }
+    return {
+      listing_id: listing.external_id,
+      estimated_market_value: 0,
+      comp_count: 0,
+      profit_potential: 0,
+      profit_percent: 0,
+      score: 0,
+      qualifies: false,
+      low_confidence: false,
+      comps_used: [],
+    }
   }
 
   const profitPotential = marketValue - listing.asking_price
@@ -20,7 +31,12 @@ export function scoreDeal(listing: Listing, comps: EbayComp[], config: ScoringCo
   const meetsProfit = profitPotential >= config.minProfitDollars
   const meetsPercent = profitPercent >= config.minProfitPercent
   const withinRange = (listing.distance_miles || 0) <= config.maxDistanceMiles
-  const qualifies = meetsProfit && meetsPercent && withinRange
+  const meetsCompCount = sampleSize >= config.minCompCount
+
+  // Qualifies for an alert only if it passes ALL filters including comp count
+  const qualifies = meetsProfit && meetsPercent && withinRange && meetsCompCount
+  // Low confidence: passes profit filters but has too few comps to trust
+  const low_confidence = meetsProfit && meetsPercent && withinRange && !meetsCompCount
 
   const percentScore = Math.min((profitPercent / 50) * 40, 40)
   const dollarScore = Math.min((profitPotential / 2000) * 40, 40)
@@ -35,6 +51,7 @@ export function scoreDeal(listing: Listing, comps: EbayComp[], config: ScoringCo
     profit_percent: Math.round(profitPercent * 10) / 10,
     score,
     qualifies,
+    low_confidence,
     comps_used: comps.slice(0, 5),
   }
 }
