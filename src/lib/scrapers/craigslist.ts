@@ -99,21 +99,6 @@ async function scrapeMarketCategory(
   const jsonData = JSON.parse(jsonLdText)
   const items: any[] = jsonData?.itemListElement || []
 
-  // Build a Map of { listingId -> full URL } from anchor tags.
-  // Using a Map keyed by the 10-digit listing ID makes the lookup
-  // position-independent — extra nav/footer links can't shift the pairing.
-  const urlMap = new Map<string, string>()
-  $('a[href]').each((_, el) => {
-    const href = $(el).attr('href') || ''
-    const idMatch = href.match(/\/(\d{10})\.html/)
-    if (idMatch) {
-      const full = href.startsWith('http')
-        ? href
-        : `https://${market.subdomain}.craigslist.org${href}`
-      urlMap.set(idMatch[1], full)
-    }
-  })
-
   const listings: Listing[] = []
   for (let i = 0; i < items.length; i++) {
     try {
@@ -126,19 +111,27 @@ async function scrapeMarketCategory(
         ? item.image
         : item.image ? [item.image] : []
 
-      // Extract the listing ID from the JSON-LD item's own url field,
-      // then look up the full URL in the map. This guarantees title and
-      // URL always refer to the same listing.
-      const itemId = item.url?.match(/\/(\d{10})\.html/)?.[1]
-      if (!itemId) continue
-      const itemUrl = urlMap.get(itemId)
+      // Use JSON-LD item.url directly — it's the canonical full URL for
+      // this specific listing, including the correct subdomain even when
+      // CL surfaces listings from nearby markets. Deriving it from anchor
+      // tags can cross-wire IDs across subdomains (IDs aren't globally unique).
+      const itemUrl: string | undefined = item.url
       if (!itemUrl) continue
+      const idMatch = itemUrl.match(/\/(\d{10})\.html/)
+      if (!idMatch) continue
+      const itemId = idMatch[1]
 
       if (!price || price < MIN_PRICE) continue
 
+      // Namespace the external_id by subdomain so the same ID in two
+      // markets doesn't collide in the `seen` set or DB unique constraint.
+      const subdomainMatch = itemUrl.match(/https:\/\/([^.]+)\.craigslist\.org/)
+      const subdomain = subdomainMatch?.[1] || market.subdomain
+      const namespacedId = `${subdomain}:${itemId}`
+
       listings.push({
         platform: 'craigslist',
-        external_id: itemId,
+        external_id: namespacedId,
         title,
         asking_price: price,
         make: extractMake(title),
